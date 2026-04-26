@@ -1,0 +1,4442 @@
+########################### Metablomics and BAT activity
+
+rm(list = ls())
+options(stringsAsFactor = F)
+
+# set as the folder saving all results generated from the following coding
+# setwd("C:/BaiduSyncdisk/R analysis/MetabolomicsKM/Data from Dennis/Out4Paper")
+out_dir  <- "C:/BaiduSyncdisk/R analysis/MetabolomicsKM/Data from Dennis/train80"
+
+
+####Step: prepare packages
+
+BiocManager::install("tximport")
+install.packages("tidyverse")
+BiocManager::install("tximportData")
+BiocManager::install("ggplot2")
+install.packages("ggplot2")
+install.packages("htmltools")
+install.packages("htmlwidgets")
+BiocManager::install("scatterPlotMatrix")
+BiocManager::install("ggscatter")
+install.packages("corrplot")
+BiocManager::install("VennDiagram")
+devtools::install_github("kassambara/ggpubr")
+
+
+library(GEOquery)
+library(dplyr)
+library(pathview)
+library("tximport")
+library("readr")
+library("tximportData")
+library("DESeq2")
+library("export")
+library(htmlwidgets)
+library(corrplot)
+library(pheatmap)
+library(corrplot)
+library (VennDiagram) 
+# library("scatterPlotMatrix")
+library("ggpubr")
+
+
+
+# VIP-1
+#####----- Put PDFF (SCV_Percentchange_PDFF) as an independent study ------##
+
+# Step 1 — Full-cohort regression（primary analysis）
+# Model:SCV_Percentchange_PDFF ~ metabolite_z + Age + Sex + BodyFatPercent + AdultChild
+# How to interpret (for writing the Results)
+# β：effect direction and magnitude
+# p / FDR：whether a population-level predictive signal exists
+# Even if all FDR values are not significant, it is still a valid conclusion (this is primary)
+
+PDFF=read.csv('C:/BaiduSyncdisk/R analysis/MetabolomicsKM/Data from Dennis/train80/PDFF_M_F_P_clean_PETnames_v2.csv',  
+              header = T, stringsAsFactors = FALSE,
+              check.names = FALSE)
+dim(PDFF)
+PDFF[1:5, 1:20]
+
+non_metab <- c(
+  "SampleNum","Type","Study_ID",
+  "Age","Sex","SexNam","AdultChild","BodyFatPercent",
+  "Precold_SCV_FF","SCV_FF_Reduction","SCV_Percentchange_PDFF",
+  "Precold_Liver_FF",
+  "lab_glucose_bl","Insulin_mUL",
+  "lab_lipids_chol","lab_lipids_tgs","lab_lipids_hdl","lab_lipids_ldl"
+)
+
+metabolite_cols <- setdiff(colnames(PDFF), non_metab)
+
+cat("Metabolite columns detected:", length(metabolite_cols), "\n")
+head(metabolite_cols, 20)
+
+# Basic check (these columns all exist in your data)
+stopifnot(all(c("SCV_Percentchange_PDFF","Age","Sex","BodyFatPercent","AdultChild") %in% colnames(PDFF)))
+
+# duplicate column names checking
+dup_names <- names(PDFF)[duplicated(names(PDFF))]
+dup_names
+length(dup_names)
+
+
+run_pdff_step1 <- function(df, metab_col, min_n = 25){
+  
+  dfm <- df %>%
+    select(
+      SCV_Percentchange_PDFF,
+      Age, Sex, BodyFatPercent, AdultChild,
+      all_of(metab_col)
+    ) %>%
+    mutate(
+      SCV_Percentchange_PDFF = as.numeric(SCV_Percentchange_PDFF),
+      Age = as.numeric(Age),
+      BodyFatPercent = as.numeric(BodyFatPercent),
+      Sex = factor(Sex),                       # here it is "male"/"female" :contentReference[oaicite:3]{index=3}
+      AdultChild = factor(AdultChild, levels = c("Adult","Child")),
+      metab_z = as.numeric(scale(as.numeric(.data[[metab_col]])))
+    ) %>%
+    select(-all_of(metab_col)) %>%
+    na.omit()
+  
+  if (nrow(dfm) < min_n) return(NULL)
+  
+  fit <- lm(
+    SCV_Percentchange_PDFF ~ metab_z + Age + Sex + BodyFatPercent + AdultChild,
+    data = dfm
+  )
+  
+  coefs <- summary(fit)$coefficients
+  
+  data.frame(
+    metabolite = metab_col,
+    n_used = nrow(dfm),
+    beta = unname(coefs["metab_z","Estimate"]),
+    se   = unname(coefs["metab_z","Std. Error"]),
+    p    = unname(coefs["metab_z","Pr(>|t|)"])
+  ) %>%
+    mutate(ci_lb = beta - 1.96*se,
+           ci_ub = beta + 1.96*se)
+}
+
+pdff_step1 <- bind_rows(lapply(metabolite_cols, run_pdff_step1, df = PDFF)) %>%
+  mutate(FDR = p.adjust(p, method = "BH")) %>%
+  arrange(FDR)
+
+head(pdff_step1, 15)
+
+
+# Step 2 — Stratified Spearman（supportive analysis: only look at direction）
+# Stratification (according to your workflow):
+# Adult + male
+# Adult + female
+# Child（sex-stratification is optional here; if needed, it can also be added）
+run_spearman_rho <- function(df, metab_col){
+  if (nrow(df) < 8) return(NA_real_)
+  suppressWarnings(
+    cor(df[[metab_col]],
+        df$SCV_Percentchange_PDFF,
+        method = "spearman",
+        use = "complete.obs")
+  )
+}
+
+spearman_tbl <- bind_rows(lapply(metabolite_cols, function(m){
+  data.frame(
+    metabolite = m,
+    rho_male_adult   = run_spearman_rho(PDFF %>% filter(AdultChild=="Adult", Sex=="male"), m),
+    rho_female_adult = run_spearman_rho(PDFF %>% filter(AdultChild=="Adult", Sex=="female"), m),
+    rho_child        = run_spearman_rho(PDFF %>% filter(AdultChild=="Child"), m)
+  )
+}))
+
+pdff_step2 <- pdff_step1 %>%
+  left_join(spearman_tbl, by = "metabolite")
+
+head(pdff_step2, 15)
+
+write.csv(pdff_step2,
+          file = file.path(out_dir, "pdff_aloneAnalysis_step2.csv"),
+          row.names = FALSE)
+
+
+# Step 3 — Interaction testing（cleaner）
+# 3A) metabolite × Sex（adults only）
+# Model:
+# SCV_Percentchange_PDFF ~ metab_z * Sex + Age + BodyFatPercent
+run_pdff_int_sex <- function(df, metab_col, min_n = 30){
+  
+  dfm <- df %>%
+    filter(AdultChild=="Adult") %>%
+    select(SCV_Percentchange_PDFF, Age, Sex, BodyFatPercent, all_of(metab_col)) %>%
+    mutate(
+      SCV_Percentchange_PDFF = as.numeric(SCV_Percentchange_PDFF),
+      Age = as.numeric(Age),
+      BodyFatPercent = as.numeric(BodyFatPercent),
+      Sex = factor(Sex),
+      metab_z = as.numeric(scale(as.numeric(.data[[metab_col]])))
+    ) %>%
+    select(-all_of(metab_col)) %>%
+    na.omit()
+  
+  if (nrow(dfm) < min_n) return(NULL)
+  
+  fit <- lm(SCV_Percentchange_PDFF ~ metab_z*Sex + Age + BodyFatPercent, data = dfm)
+  coefs <- summary(fit)$coefficients
+  int_term <- grep("^metab_z:Sex", rownames(coefs), value = TRUE)
+  
+  data.frame(
+    metabolite = metab_col,
+    beta_int_sex = if(length(int_term)==1) unname(coefs[int_term,"Estimate"]) else NA_real_,
+    p_int_sex    = if(length(int_term)==1) unname(coefs[int_term,"Pr(>|t|)"]) else NA_real_
+  )
+}
+
+# 3B) metabolite × AdultChild（adults vs children）
+# Model:
+# SCV_Percentchange_PDFF ~ metab_z * AdultChild + Age + Sex + BodyFatPercent
+run_pdff_int_agegroup <- function(df, metab_col, min_n = 30){
+  
+  dfm <- df %>%
+    select(SCV_Percentchange_PDFF, Age, Sex, BodyFatPercent, AdultChild, all_of(metab_col)) %>%
+    mutate(
+      SCV_Percentchange_PDFF = as.numeric(SCV_Percentchange_PDFF),
+      Age = as.numeric(Age),
+      BodyFatPercent = as.numeric(BodyFatPercent),
+      Sex = factor(Sex),
+      AdultChild = factor(AdultChild, levels = c("Adult","Child")),
+      metab_z = as.numeric(scale(as.numeric(.data[[metab_col]])))
+    ) %>%
+    select(-all_of(metab_col)) %>%
+    na.omit()
+  
+  if (nrow(dfm) < min_n) return(NULL)
+  
+  fit <- lm(SCV_Percentchange_PDFF ~ metab_z*AdultChild + Age + Sex + BodyFatPercent, data = dfm)
+  coefs <- summary(fit)$coefficients
+  int_term <- "metab_z:AdultChildChild"
+  
+  data.frame(
+    metabolite = metab_col,
+    beta_int_agegroup = if(int_term %in% rownames(coefs)) unname(coefs[int_term,"Estimate"]) else NA_real_,
+    p_int_agegroup    = if(int_term %in% rownames(coefs)) unname(coefs[int_term,"Pr(>|t|)"]) else NA_real_
+  )
+}
+
+# Merge Step 3 (final results table)
+
+library(dplyr)
+pdff_int_age <- bind_rows(lapply(metabolite_cols, run_pdff_int_agegroup, df = PDFF))
+pdff_int_sex <- bind_rows(lapply(metabolite_cols, run_pdff_int_sex, df = PDFF))
+
+head(pdff_int_age, 15)
+head(pdff_int_sex, 15)
+
+
+# Check
+stopifnot("metabolite" %in% colnames(pdff_int_sex))
+stopifnot("metabolite" %in% colnames(pdff_int_age))  # your pdff_int_age column was already named metabolite before
+
+pdff_step3 <- pdff_step2 %>%
+  left_join(pdff_int_sex, by = "metabolite") %>%
+  left_join(pdff_int_age,  by = "metabolite")
+
+head(pdff_step3, 10)
+pdff_step3 %>%
+  arrange(p) %>%
+  head(10)
+
+write.csv(pdff_step3,
+          file = file.path(out_dir, "pdff_aloneAnalysis_step3.csv"),
+          row.names = FALSE)
+
+pdff_step3=read.csv('C:/BaiduSyncdisk/R analysis/MetabolomicsKM/Data from Dennis/train80/pdff_aloneAnalysis_step3.csv',  
+                                  header = T, stringsAsFactors = FALSE,
+                                  check.names = FALSE)
+
+## Plot the figure
+# 1) Prepare plotting data first (Top N + calculate CI + direction)
+library(dplyr)
+library(ggplot2)
+
+# Choose how many metabolites to display (ranked by smallest full-cohort p)
+topN <- 20
+
+plot_dat <- pdff_step3 %>%
+  filter(!is.na(beta), !is.na(p)) %>%
+  arrange(p) %>%
+  slice_head(n = topN) %>%
+  mutate(
+    # Use p to map point size (strength of evidence)
+    sig = -log10(pmax(p, 1e-300)),
+    # # p<0.05 use triangle shape (optional)
+    # shape_sig = ifelse(p < 0.05, "p<0.05", "p≥0.05"),
+    # direction of ρ (positive/negative only)
+    dir_male   = ifelse(rho_male_adult   >= 0, "+", "-"),
+    dir_female = ifelse(rho_female_adult >= 0, "+", "-"),
+    dir_child  = ifelse(rho_child        >= 0, "+", "-"),
+    metabolite = factor(metabolite, levels = rev(metabolite))
+  )
+
+# 2) Figure A: full-cohort β (points) + p strength (point size) + p<0.05 shape
+BASE_SIZE <- 13  # ✅ unified font size (you can change it to 12/14, etc.)
+
+p_beta <- ggplot(plot_dat, aes(x = beta, y = metabolite)) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
+  
+  geom_errorbarh(
+    aes(xmin = ci_lb, xmax = ci_ub),
+    height = 0.25,
+    linewidth = 0.4,
+    alpha = 0.8
+  ) +
+  
+  geom_point(
+    aes(size = sig),
+    shape = 16,
+    alpha = 0.9,
+    stroke = 0.4
+  ) +
+  
+  geom_point(
+    data = subset(plot_dat, p < 0.05),
+    aes(size = sig),
+    shape = 17,
+    alpha = 0.9,
+    stroke = 0.4,
+    show.legend = FALSE
+  ) +
+  
+  scale_size_continuous(name = "-log10(p)") +
+  labs(
+    x = "Full-cohort regression beta (per 1 SD metabolite)",
+    y = NULL,
+    title = "PDFF-defined BAT activity"
+  ) +
+  
+  theme_classic(base_size = BASE_SIZE) +
+  theme(
+    # ✅ Core: unify all fonts
+    text = element_text(size = BASE_SIZE),
+    
+    plot.title   = element_text(size = BASE_SIZE),
+    axis.title.x = element_text(size = BASE_SIZE),
+    axis.title.y = element_text(size = BASE_SIZE),
+    axis.text.x  = element_text(size = BASE_SIZE),
+    axis.text.y  = element_text(size = BASE_SIZE),
+    
+    legend.title = element_text(size = BASE_SIZE),
+    legend.text  = element_text(size = BASE_SIZE)
+  )
+
+p_beta
+
+# 3) Figure B: direction matrix (sign of ρ; optionally use transparency to show |ρ|)
+# 
+# First convert the three rho columns to long format:
+
+BASE_SIZE <- 13
+
+rho_long <- plot_dat %>%
+  select(metabolite, rho_male_adult, rho_female_adult, rho_child) %>%
+  tidyr::pivot_longer(
+    cols = starts_with("rho_"),
+    names_to = "group",
+    values_to = "rho"
+  ) %>%
+  mutate(
+    group = recode(group,
+                   "rho_male_adult" = "Adult male",
+                   "rho_female_adult" = "Adult female",
+                   "rho_child" = "Children male"),
+    group = factor(group, levels = c("Adult male","Adult female","Children male")),
+    dir = ifelse(rho >= 0, "Positive", "Negative"),
+    abs_rho = pmin(abs(rho), 1)
+  )
+
+p_rho <- ggplot(rho_long, aes(x = group, y = metabolite)) +
+  geom_tile(aes(alpha = abs_rho, fill = dir),
+            color = "white", linewidth = 0.3) +
+  
+  scale_alpha_continuous(range = c(0.3, 1), guide = "none") +
+  
+  scale_fill_manual(
+    values = c(
+      "Positive" = "#E64B35",
+      "Negative" = "#4DBBD5"
+    )
+  ) +
+  
+  labs(
+    x = NULL,
+    y = NULL,
+    fill = "Spearman direction",
+    title = "Spearman ρ across subgroups"
+  ) +
+  
+  theme_classic(base_size = BASE_SIZE) +
+  
+  theme(
+    # ✅ globally unified
+    text = element_text(size = BASE_SIZE),
+    
+    plot.title   = element_text(size = BASE_SIZE),
+    axis.title.x = element_text(size = BASE_SIZE),
+    axis.title.y = element_text(size = BASE_SIZE),
+    axis.text.x  = element_text(size = BASE_SIZE, angle = 45, hjust = 1, vjust = 1),
+    axis.text.y  = element_blank(),   # keep hidden
+    
+    legend.title = element_text(size = BASE_SIZE),
+    legend.text  = element_text(size = BASE_SIZE),
+    
+    axis.ticks.y = element_blank()
+  )
+
+p_rho
+
+# 4) Combine into one figure (simplest way without installing patchwork: print in sequence)
+# If you are willing to install the lightweight package patchwork (recommended), you can place them side by side:
+# install.packages("patchwork")
+library(patchwork)
+p=p_beta + p_rho + plot_layout(widths = c(2.2, 1))
+p
+
+# Output
+tif_path <- file.path(out_dir, "PDFF_Primary_Regr_v1")
+
+graph2tif(x = p, file = tif_path, font = "Arial", cairo = TRUE,
+          width = 10, height = 5.5, bg = "transparent")
+graph2svg(x = p, file = tif_path, font = "Arial", cairo = TRUE,
+          width = 10, height = 5.5, bg = "transparent")
+
+
+
+# Perform subgroup regression only for metabolites with interaction signals
+# Adult male-only regression（secondary）
+run_pdff_subgroup <- function(df, metab_col, min_n = 20){
+  
+  dfm <- df %>%
+    select(
+      SCV_Percentchange_PDFF,
+      Age, BodyFatPercent,
+      all_of(metab_col)
+    ) %>%
+    mutate(
+      SCV_Percentchange_PDFF = as.numeric(SCV_Percentchange_PDFF),
+      Age = as.numeric(Age),
+      BodyFatPercent = as.numeric(BodyFatPercent),
+      metab_z = as.numeric(scale(as.numeric(.data[[metab_col]])))
+    ) %>%
+    select(-all_of(metab_col)) %>%
+    na.omit()
+  
+  if (nrow(dfm) < min_n) return(NULL)
+  
+  fit <- lm(
+    SCV_Percentchange_PDFF ~ metab_z + Age + BodyFatPercent,
+    data = dfm
+  )
+  
+  coefs <- summary(fit)$coefficients
+  
+  data.frame(
+    metabolite = metab_col,
+    n = nrow(dfm),
+    beta = coefs["metab_z","Estimate"],
+    p = coefs["metab_z","Pr(>|t|)"]
+  )
+}
+
+# Only analyze metabolites with interaction p < 0.1
+candidates <- pdff_step3 %>%
+  filter(p_int_sex < 0.10 | p_int_agegroup < 0.10) %>%
+  pull(metabolite)
+
+adult_male_res <- bind_rows(
+  lapply(candidates,
+         run_pdff_subgroup,
+         df = PDFF %>% filter(AdultChild=="Adult", Sex=="male"))
+)
+
+write.csv(adult_male_res,
+          file = file.path(out_dir, "adult_male_res.csv"),
+          row.names = FALSE)
+
+
+# Adult female-only regression（secondary）
+library(dplyr)
+run_pdff_subgroup_female <- function(df, metab_col, min_n = 15){
+  
+  dfm <- df %>%
+    select(
+      SCV_Percentchange_PDFF,
+      Age, BodyFatPercent,
+      all_of(metab_col)
+    ) %>%
+    mutate(
+      SCV_Percentchange_PDFF = as.numeric(SCV_Percentchange_PDFF),
+      Age = as.numeric(Age),
+      BodyFatPercent = as.numeric(BodyFatPercent),
+      metab_z = as.numeric(scale(as.numeric(.data[[metab_col]])))
+    ) %>%
+    select(-all_of(metab_col)) %>%
+    na.omit()
+  
+  # ✅ Do not return(NULL), to avoid problems in downstream bind_rows / join
+  if (nrow(dfm) < min_n) {
+    return(data.frame(
+      metabolite = metab_col,
+      n = nrow(dfm),
+      beta = NA_real_,
+      p = NA_real_
+    ))
+  }
+  
+  fit <- lm(
+    SCV_Percentchange_PDFF ~ metab_z + Age + BodyFatPercent,
+    data = dfm
+  )
+  
+  coefs <- summary(fit)$coefficients
+  
+  data.frame(
+    metabolite = metab_col,
+    n = nrow(dfm),
+    beta = unname(coefs["metab_z","Estimate"]),
+    p = unname(coefs["metab_z","Pr(>|t|)"])
+  )
+}
+
+# Only analyze metabolites with interaction signals (secondary)
+candidates <- pdff_step3 %>%
+  filter((!is.na(p_int_sex) & p_int_sex < 0.10) | (!is.na(p_int_agegroup) & p_int_agegroup < 0.10)) %>%
+  pull(metabolite) %>%
+  unique()
+
+adult_female_res <- bind_rows(
+  lapply(
+    candidates,
+    run_pdff_subgroup_female,
+    df = PDFF %>% filter(AdultChild == "Adult", Sex == "female")
+  )
+) %>%
+  arrange(p)
+
+write.csv(
+  adult_female_res,
+  file = file.path(out_dir, "adult_female_res.csv"),
+  row.names = FALSE
+)
+
+# Children-only regression（secondary）
+library(dplyr)
+run_pdff_subgroup_child <- function(df, metab_col, min_n = 15){
+  
+  dfm <- df %>%
+    select(
+      SCV_Percentchange_PDFF,
+      Age, BodyFatPercent,
+      all_of(metab_col)
+    ) %>%
+    mutate(
+      SCV_Percentchange_PDFF = as.numeric(SCV_Percentchange_PDFF),
+      Age = as.numeric(Age),
+      BodyFatPercent = as.numeric(BodyFatPercent),
+      metab_z = as.numeric(scale(as.numeric(.data[[metab_col]])))
+    ) %>%
+    select(-all_of(metab_col)) %>%
+    na.omit()
+  
+  # Do not return(NULL), to keep bind_rows safe
+  if (nrow(dfm) < min_n) {
+    return(data.frame(
+      metabolite = metab_col,
+      n = nrow(dfm),
+      beta = NA_real_,
+      p = NA_real_
+    ))
+  }
+  
+  fit <- lm(
+    SCV_Percentchange_PDFF ~ metab_z + Age + BodyFatPercent,
+    data = dfm
+  )
+  
+  coefs <- summary(fit)$coefficients
+  
+  data.frame(
+    metabolite = metab_col,
+    n = nrow(dfm),
+    beta = unname(coefs["metab_z","Estimate"]),
+    p = unname(coefs["metab_z","Pr(>|t|)"])
+  )
+}
+
+# Run only metabolites with interaction signals (secondary)
+candidates <- pdff_step3 %>%
+  filter((!is.na(p_int_sex) & p_int_sex < 0.10) |
+           (!is.na(p_int_agegroup) & p_int_agegroup < 0.10)) %>%
+  pull(metabolite) %>%
+  unique()
+
+children_res <- bind_rows(
+  lapply(
+    candidates,
+    run_pdff_subgroup_child,
+    df = PDFF %>% filter(AdultChild == "Child")
+  )
+) %>%
+  arrange(p)
+
+write.csv(
+  children_res,
+  file = file.path(out_dir, "children_res.csv"),
+  row.names = FALSE
+)
+
+
+## Plot figure
+# 1) Merge results from three groups and select top metabolites (to avoid overcrowding)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# 1) Merge three groups
+plot_df <- bind_rows(
+  adult_male_res   %>% mutate(subgroup = "Adult male"),
+  adult_female_res %>% mutate(subgroup = "Adult female"),
+  children_res     %>% mutate(subgroup = "Children male")
+) %>%
+  mutate(
+    subgroup = factor(subgroup, levels = c("Adult male","Adult female","Children male")),
+    p = as.numeric(p),
+    beta = as.numeric(beta),
+    sig = -log10(pmax(p, 1e-300))
+  )
+
+# 2) Select metabolites with p < 0.08 in any subgroup (union)
+sel_mets <- plot_df %>%
+  group_by(metabolite) %>%
+  summarize(min_p = min(p, na.rm = TRUE), .groups = "drop") %>%
+  filter(is.finite(min_p) & min_p < 0.08) %>%
+  arrange(min_p) %>%
+  pull(metabolite)
+
+
+sel_mets <- plot_df %>%
+  group_by(metabolite) %>%
+  summarize(min_p = min(p, na.rm = TRUE), .groups = "drop") %>%
+  filter(is.finite(min_p)) %>%
+  arrange(min_p) %>%
+  slice_head(n = 12) %>%
+  pull(metabolite)
+
+
+plot_df_sel <- plot_df %>%
+  filter(metabolite %in% sel_mets) %>%
+  # Order metabolites by minimum p (looks better)
+  left_join(
+    plot_df %>% group_by(metabolite) %>%
+      summarize(min_p = min(p, na.rm = TRUE), .groups = "drop"),
+    by = "metabolite"
+  ) %>%
+  mutate(metabolite = factor(metabolite, levels = rev(sel_mets)))
+
+plot_df_sel <- plot_df_sel %>%
+  mutate(
+    shape_sig = ifelse(!is.na(p) & p < 0.05, "p<0.05", "p≥0.05")
+  )
+
+# 3) Plot: colors distinguish the three groups, point size represents significance
+BASE_SIZE <- 14
+
+p <- ggplot(plot_df_sel, aes(x = beta, y = metabolite)) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
+  
+  geom_point(
+    aes(color = subgroup, size = sig, shape = shape_sig),
+    alpha = 0.85
+  ) +
+  
+  facet_wrap(~ subgroup, nrow = 1, scales = "free_x") +
+  
+  scale_size_continuous(name = "-log10(p)") +
+  
+  scale_shape_manual(
+    values = c("p≥0.05" = 16, "p<0.05" = 17),
+    name = "Significance"
+  ) +
+  
+  labs(
+    x = "Regression beta (per 1 SD metabolite)",
+    y = NULL,
+    color = "Subgroup",
+    title = "Secondary subgroup regression analyses for metabolites with interaction signals",
+    subtitle = "Metabolites with min(p) < 0.08 in any subgroup"
+  ) +
+  
+  theme_classic(base_size = BASE_SIZE) +
+  
+  theme(
+    # ✅ globally unified（key）
+    text = element_text(size = BASE_SIZE),
+    
+    # ---- facet ----
+    strip.background = element_blank(),
+    strip.text = element_text(size = BASE_SIZE, face = "bold"),
+    
+    # ---- axis ----
+    axis.title.x = element_text(size = BASE_SIZE),
+    axis.title.y = element_text(size = BASE_SIZE),
+    axis.text.x  = element_text(size = BASE_SIZE),
+    axis.text.y  = element_text(size = BASE_SIZE),
+    
+    # ---- legend ----
+    legend.title = element_text(size = BASE_SIZE),
+    legend.text  = element_text(size = BASE_SIZE),
+    
+    # ---- title ----
+    plot.title    = element_text(size = BASE_SIZE, face = "bold"),
+    plot.subtitle = element_text(size = BASE_SIZE)
+  )
+
+p
+
+# Output
+tif_path <- file.path(out_dir, "PDFF_F_M_P_Regr_v1")
+
+graph2tif(x = p, file = tif_path, font = "Arial", cairo = TRUE,
+          width = 11, height = 5, bg = "transparent")
+graph2svg(x = p, file = tif_path, font = "Arial", cairo = TRUE,
+          width = 11, height = 5, bg = "transparent")
+
+
+
+
+##Plotting: interaction terms, using beta_int_sex, p_int_sex, beta_int_agegroup, p_int_agegroup
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# Choose how many metabolites to display: rank by the smallest p across the two interaction types and take TopN
+topN <- 15
+
+plot_int <- pdff_step3 %>%
+  transmute(
+    metabolite,
+    beta_int_sex,
+    p_int_sex,
+    beta_int_agegroup,
+    p_int_agegroup
+  ) %>%
+  mutate(
+    min_p = pmin(p_int_sex, p_int_agegroup, na.rm = TRUE)
+  ) %>%
+  arrange(min_p) %>%
+  slice_head(n = topN) %>%
+  select(-min_p) %>%
+  pivot_longer(
+    cols = c(beta_int_sex, p_int_sex, beta_int_agegroup, p_int_agegroup),
+    names_to = c(".value", "interaction"),
+    names_pattern = "(beta|p)_int_(sex|agegroup)"
+  ) %>%
+  mutate(
+    interaction = recode(interaction,
+                         "sex" = "Metabolite × Sex (Adults)",
+                         "agegroup" = "Metabolite × AdultChild"),
+    sig = -log10(pmax(p, 1e-300)),
+    shape_sig = ifelse(!is.na(p) & p < 0.05, "p<0.05", "p≥0.05")
+  )
+
+# To keep the y-axis order consistent across the two panels: arrange metabolites by minimum p
+met_order <- pdff_step3 %>%
+  transmute(metabolite,
+            min_p = pmin(p_int_sex, p_int_agegroup, na.rm = TRUE)) %>%
+  arrange(min_p) %>%
+  slice_head(n = topN) %>%
+  pull(metabolite)
+
+plot_int <- plot_int %>%
+  mutate(metabolite = factor(metabolite, levels = rev(met_order)))
+
+BASE_SIZE <- 14
+
+p_int <- ggplot(plot_int, aes(x = beta, y = metabolite)) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
+  
+  geom_point(
+    aes(
+      size  = sig,
+      shape = shape_sig,
+      color = interaction
+    ),
+    alpha = 0.9
+  ) +
+  
+  facet_wrap(~ interaction, nrow = 1, scales = "free_x") +
+  
+  scale_size_continuous(name = "-log10(p_int)") +
+  
+  scale_shape_manual(
+    values = c("p≥0.05" = 16, "p<0.05" = 17),
+    name = NULL
+  ) +
+  
+  scale_color_manual(
+    values = c(
+      "Metabolite × Sex (Adults)" = "#D55E00",
+      "Metabolite × AdultChild"  = "#0072B2"
+    ),
+    name = "Interaction type"
+  ) +
+  
+  labs(
+    x = "Interaction beta (effect modification)",
+    y = NULL,
+    title = "Interaction effects in PDFF cohort"
+  ) +
+  
+  theme_classic(base_size = BASE_SIZE) +
+  
+  theme(
+    # ✅ globally unified
+    text = element_text(size = BASE_SIZE),
+    
+    # ---- facet ----
+    strip.background = element_blank(),
+    strip.text = element_text(size = BASE_SIZE, face = "bold"),
+    
+    # ---- axis ----
+    axis.title.x = element_text(size = BASE_SIZE),
+    axis.title.y = element_text(size = BASE_SIZE),
+    axis.text.x  = element_text(size = BASE_SIZE),
+    axis.text.y  = element_text(size = BASE_SIZE),
+    
+    # ---- legend ----
+    legend.title = element_text(size = BASE_SIZE),
+    legend.text  = element_text(size = BASE_SIZE),
+    
+    # ---- title ----
+    plot.title = element_text(size = BASE_SIZE, face = "bold"),
+    
+    # ---- layout ----
+    legend.position = "right"
+  )
+
+p_int
+
+# Output
+tif_path <- file.path(out_dir, "PDFF_Interaction")
+
+graph2tif(x = p_int, file = tif_path, font = "Arial", cairo = TRUE,
+          width = 10, height = 4.5, bg = "transparent")
+graph2svg(x = p_int, file = tif_path, font = "Arial", cairo = TRUE,
+          width = 10, height = 4.5, bg = "transparent")
+
+
+
+#VIP1 done----
+
+
+
+
+
+
+
+## Supplementary figures
+# Adult male、Adult female、Child perform Spearman correlation analysis
+
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(tidyr)
+library(purrr)
+
+BASE_SIZE <- 16
+
+#========================
+# 1) Prepare data
+#========================
+pdff_df <- PDFF
+
+# Automatically identify non-metabolite columns
+non_metab <- c(
+  "SampleNum","Type","Study_ID",
+  "Age","Sex","SexNam","AdultChild","BodyFatPercent",
+  "Precold_SCV_FF","SCV_FF_Reduction","SCV_Percentchange_PDFF",
+  "Precold_Liver_FF",
+  "lab_glucose_bl","Insulin_mUL",
+  "lab_lipids_chol","lab_lipids_tgs","lab_lipids_hdl","lab_lipids_ldl"
+)
+
+metabolite_cols <- setdiff(colnames(pdff_df), non_metab)
+
+# Numeric conversion function
+numify <- function(x){
+  suppressWarnings(as.numeric(as.character(x)))
+}
+
+#========================
+# 2) Define stratification
+#========================
+df_adult_m <- pdff_df %>%
+  filter(AdultChild == "Adult", SexNam %in% c("male", "Male"))
+
+df_adult_f <- pdff_df %>%
+  filter(AdultChild == "Adult", SexNam %in% c("female", "Female"))
+
+df_child <- pdff_df %>%
+  filter(AdultChild == "Child")
+
+#========================
+# 3) Spearman analysis function
+#========================
+run_spearman_one <- function(df, metab_col, outcome_col = "SCV_Percentchange_PDFF"){
+  tmp <- df[, c(metab_col, outcome_col), drop = FALSE]
+  colnames(tmp) <- c("metab", "outcome")
+  
+  tmp$metab   <- numify(tmp$metab)
+  tmp$outcome <- numify(tmp$outcome)
+  tmp <- tmp[complete.cases(tmp), , drop = FALSE]
+  
+  n_use <- nrow(tmp)
+  if(n_use < 8){
+    return(data.frame(
+      metabolite = metab_col,
+      n = n_use,
+      rho = NA_real_,
+      p = NA_real_
+    ))
+  }
+  
+  ct <- suppressWarnings(
+    cor.test(tmp$metab, tmp$outcome, method = "spearman", exact = FALSE)
+  )
+  
+  data.frame(
+    metabolite = metab_col,
+    n = n_use,
+    rho = unname(ct$estimate),
+    p = ct$p.value
+  )
+}
+
+run_spearman_panel <- function(df, metab_cols, outcome_col = "SCV_Percentchange_PDFF"){
+  bind_rows(lapply(metab_cols, function(m){
+    run_spearman_one(df, m, outcome_col = outcome_col)
+  })) %>%
+    mutate(
+      logp = -log10(p),
+      group = case_when(
+        !is.na(rho) & rho >  0.2 & p < 0.05 ~ "up",
+        !is.na(rho) & rho < -0.2 & p < 0.05 ~ "down",
+        TRUE ~ "normal"
+      ),
+      group = factor(group, levels = c("down", "normal", "up"))
+    ) %>%
+    arrange(rho)
+}
+
+#========================
+# 4) Run the three strata
+#========================
+res_adult_m <- run_spearman_panel(df_adult_m, metabolite_cols)
+res_adult_f <- run_spearman_panel(df_adult_f, metabolite_cols)
+res_child   <- run_spearman_panel(df_child,   metabolite_cols)
+
+#========================
+# 5) Plotting function (similar to the attachment)
+#========================
+plot_spearman_volcano <- function(res_df,
+                                  title_txt = "Spearman",
+                                  xlim_expand = 0.08,
+                                  label_top_n = NULL){
+  
+  plot_df <- res_df %>%
+    filter(!is.na(rho), !is.na(p), is.finite(logp))
+  
+  # Count numbers
+  n_up     <- sum(plot_df$group == "up", na.rm = TRUE)
+  n_down   <- sum(plot_df$group == "down", na.rm = TRUE)
+  n_normal <- sum(plot_df$group == "normal", na.rm = TRUE)
+  
+  sub_txt <- paste0(
+    "Up (rho>0.2): ", n_up,
+    "   Down (rho<-0.2): ", n_down,
+    "   p<0.05"
+  )
+  
+  # Label only significant points
+  lab_df <- plot_df %>%
+    filter(group != "normal")
+  
+  # If you only want to label the most significant few, set label_top_n
+  if(!is.null(label_top_n)){
+    lab_df <- lab_df %>%
+      arrange(p) %>%
+      slice_head(n = label_top_n)
+  }
+  
+  x_max <- max(abs(plot_df$rho), na.rm = TRUE) + xlim_expand
+  
+  ggplot(plot_df, aes(x = rho, y = logp, color = group)) +
+    geom_vline(xintercept = c(-0.2, 0.2), linetype = "dashed", color = "black", linewidth = 0.5) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black", linewidth = 0.5) +
+    
+    geom_point(size = 2.2, alpha = 0.9) +
+    
+    ggrepel::geom_text_repel(
+      data = lab_df,
+      aes(label = metabolite),
+      size = BASE_SIZE / 3.5,
+      box.padding = 0.25,
+      point.padding = 0.15,
+      segment.size = 0.25,
+      max.overlaps = Inf,
+      show.legend = FALSE
+    ) +
+    
+    scale_color_manual(
+      values = c(
+        "down"   = "#2C7FB8",
+        "normal" = "#B3B3B3",
+        "up"     = "#D7191C"
+      )
+    ) +
+    
+    coord_cartesian(xlim = c(-x_max, x_max)) +
+    
+    labs(
+      title = title_txt,
+      subtitle = sub_txt,
+      x = "Spearman rho (metabolites & SCV_PDFF%)",
+      y = "-log10(p-value)",
+      color = "Group"
+    ) +
+    
+    theme_classic(base_size = BASE_SIZE) +
+    theme(
+      text = element_text(size = BASE_SIZE),
+      plot.title = element_text(size = BASE_SIZE, face = "bold"),
+      plot.subtitle = element_text(size = BASE_SIZE - 1),
+      axis.title.x = element_text(size = BASE_SIZE),
+      axis.title.y = element_text(size = BASE_SIZE),
+      axis.text.x = element_text(size = BASE_SIZE),
+      axis.text.y = element_text(size = BASE_SIZE),
+      legend.title = element_text(size = BASE_SIZE),
+      legend.text = element_text(size = BASE_SIZE)
+    )
+}
+
+#========================
+# 6) Plot separately
+#========================
+p_adult_m <- plot_spearman_volcano(
+  res_adult_m,
+  title_txt = "Adult male_Spearman"
+)
+
+p_adult_f <- plot_spearman_volcano(
+  res_adult_f,
+  title_txt = "Adult femal_Spearman"
+)
+
+p_child <- plot_spearman_volcano(
+  res_child,
+  title_txt = "Children male_Spearman"
+)
+
+# Display separately
+p_adult_m
+p_adult_f
+p_child
+
+
+# Output
+tif_path <- file.path(out_dir, "Adult male_Spearman")
+
+graph2tif(x = p_adult_m, file = tif_path, font = "Arial", cairo = TRUE,
+          width = 5.5, height = 4, bg = "transparent")
+graph2svg(x = p_adult_m, file = tif_path, font = "Arial", cairo = TRUE,
+          width = 5.5, height = 4, bg = "transparent")
+
+tif_path <- file.path(out_dir, "Adult female_Spearman")
+graph2tif(x = p_adult_f, file = tif_path, font = "Arial", cairo = TRUE,
+          width = 5.5, height = 4, bg = "transparent")
+graph2svg(x = p_adult_f, file = tif_path, font = "Arial", cairo = TRUE,
+          width = 5.5, height = 4, bg = "transparent")
+
+tif_path <- file.path(out_dir, "ChildMale_Spearman")
+graph2tif(x = p_child, file = tif_path, font = "Arial", cairo = TRUE,
+          width = 5.5, height = 4, bg = "transparent")
+graph2svg(x = p_child, file = tif_path, font = "Arial", cairo = TRUE,
+          width = 5.5, height = 4, bg = "transparent")
+
+
+
+
+
+
+#------ VIP2 ----- 
+## =========================
+## 6) PDFF Elastic Net training (PDFF_index; PDFF-only features) including Adult Males/females and Children
+## =========================
+library(dplyr)
+
+# Numeric conversion function
+numify <- function(x){
+  suppressWarnings(as.numeric(as.character(x)))
+}
+## Load data
+PDFF=read.csv('C:/BaiduSyncdisk/R analysis/MetabolomicsKM/Data from Dennis/train80/PDFF_M_F_P_clean_PETnames_v2.csv',  
+              header = T, stringsAsFactors = FALSE,
+              check.names = FALSE)
+dim(PDFF)
+PDFF[1:5, 1:20]
+pdff_df = PDFF
+
+## Select Candidates
+pick_met_col <- function(df){
+  if ("metabolite_label" %in% colnames(df)) return("metabolite_label")
+  if ("metabolite" %in% colnames(df)) return("metabolite")
+  stop("Cannot find metabolite_label/metabolite in a candidate table.")
+}
+
+get_sig <- function(df, p_cut = 0.05){
+  df %>%
+    filter(p < p_cut) %>%
+    pull(all_of(pick_met_col(df))) %>%
+    as.character() %>% unique()
+}
+
+pdff_candidates <- unique(c(
+  get_sig(adult_male_res, 0.05),
+  get_sig(adult_female_res, 0.05),
+  get_sig(children_res, 0.05)
+))
+
+pdff_features <- intersect(pdff_candidates, colnames(pdff_df))
+message("PDFF candidate labels present as columns: ", length(pdff_features), "/", length(pdff_candidates))
+if(length(pdff_features) < 9){
+  stop("Too few PDFF candidate metabolites found as PDFF columns. Need PDFF label mapping or relax candidates.")
+}
+
+# numeric + zscore
+pdff_tmp <- pdff_df
+pdff_tmp[, pdff_features] <- lapply(pdff_tmp[, pdff_features, drop = FALSE], numify)
+
+zscore_df <- function(df, cols){
+  X <- df[, cols, drop = FALSE]
+  X <- as.data.frame(lapply(X, numify))
+  mu <- sapply(X, function(v) mean(v, na.rm = TRUE))
+  sdv <- sapply(X, function(v) sd(v, na.rm = TRUE))
+  sdv[is.na(sdv) | sdv == 0] <- 1
+  Xz <- sweep(X, 2, mu, "-")
+  Xz <- sweep(Xz, 2, sdv, "/")
+  Xz <- as.data.frame(Xz)
+  colnames(Xz) <- cols
+  Xz
+}
+
+median_impute_matrix <- function(X){
+  X <- as.matrix(X)
+  for(j in seq_len(ncol(X))){
+    v <- X[, j]
+    if(anyNA(v)){
+      med <- median(v, na.rm = TRUE)
+      v[is.na(v)] <- med
+      X[, j] <- v
+    }
+  }
+  X
+}
+
+pdff_mets_z <- zscore_df(pdff_tmp, pdff_features)
+
+
+# build X/y with keep + min_nonNA filter (your proven safe approach)
+library(glmnet)
+pdff_outcome_col <- "SCV_Percentchange_PDFF"
+pdff_covars      <- c("Age", "Sex", "BodyFatPercent", "AdultChild")
+ENET_ALPHA <- 0.2  # 0.5 = elastic net; 1 = lasso 
+#In the case of union 60 (high collinearity + p≈n), alpha=0.5 + 1se can easily produce all zeros; ENET_ALPHA <- 0.2   # or 0.1
+
+build_Xy_pdff_final2 <- function(df, outcome_col, covars, mets_df){
+  stopifnot(nrow(df) == nrow(mets_df))
+  
+  # 1) outcome + keep rows (determine this first)
+  y_all <- numify(df[[outcome_col]])
+  keep  <- is.finite(y_all)
+  
+  df2   <- df[keep, , drop = FALSE]
+  y     <- y_all[keep]
+  mets2 <- mets_df[keep, , drop = FALSE]
+  
+  # 2) covariates clean + impute
+  cov_df <- df2[, covars, drop = FALSE]
+  for(cc in covars){
+    v <- cov_df[[cc]]
+    
+    # character -> factor (trim)
+    if(is.character(v)) v <- factor(trimws(v))
+    
+    # drop 1-level factors
+    if(is.factor(v) && nlevels(v) < 2){
+      cov_df[[cc]] <- NULL
+      next
+    }
+    
+    # numeric impute
+    if(!is.factor(v)){
+      v <- numify(v)
+      if(anyNA(v)) v[is.na(v)] <- median(v, na.rm = TRUE)
+      cov_df[[cc]] <- v
+    } else {
+      # factor: replace NA with "Missing"
+      vv <- as.character(v)
+      vv[is.na(vv) | vv==""] <- "Missing"
+      cov_df[[cc]] <- factor(vv)
+      if(nlevels(cov_df[[cc]]) < 2) cov_df[[cc]] <- NULL
+    }
+  }
+  
+  # 3) metabolites: drop all-NA/low-nonNA columns (CRITICAL for PDFF)
+  mets2 <- as.data.frame(mets2, check.names = FALSE)
+  nonNA <- colSums(!is.na(mets2))
+  min_nonNA <- 10  # you can change this to 5/10/20; for PDFF n=92, 10 is quite reasonable
+  mets2 <- mets2[, nonNA >= min_nonNA, drop = FALSE]
+  
+  # Force numeric conversion (to avoid odd data types)
+  mets2 <- as.data.frame(lapply(mets2, numify), check.names = FALSE)
+  
+  # 4) build model matrix WITHOUT dropping rows
+  mm_df <- data.frame(cov_df, mets2, check.names = FALSE)
+  X <- model.matrix(~ . , data = mm_df, na.action = na.pass)[, -1, drop = FALSE]
+  
+  # 5) impute remaining NA in X
+  X <- median_impute_matrix(X)
+  
+  list(X = X, y = y, keep = keep, kept_mets = colnames(mets2))
+}
+
+
+pdff_xy <- build_Xy_pdff_final2(
+  df          = pdff_df,
+  outcome_col = pdff_outcome_col,
+  covars      = pdff_covars,
+  mets_df     = pdff_mets_z
+)
+X_pdff <- pdff_xy$X
+y_pdff <- pdff_xy$y
+message("PDFF training n=", length(y_pdff), " p=", ncol(X_pdff),
+        " | kept_mets=", length(pdff_xy$kept_mets))
+
+# unpenalize covariates
+cov_mm_pdff <- model.matrix(~ . , data = pdff_df[pdff_xy$keep, pdff_covars, drop = FALSE],
+                            na.action = na.pass)[, -1, drop = FALSE]
+cov_cols_in_X_pdff <- intersect(colnames(cov_mm_pdff), colnames(X_pdff))
+
+penalty_pdff <- rep(1, ncol(X_pdff)); names(penalty_pdff) <- colnames(X_pdff)
+penalty_pdff[cov_cols_in_X_pdff] <- 0
+
+cv_pdff <- cv.glmnet(
+  x = X_pdff, y = y_pdff,
+  alpha = ENET_ALPHA,
+  nfolds = min(10, length(y_pdff)),
+  standardize = FALSE,
+  penalty.factor = penalty_pdff
+)
+
+coef_nonzero <- function(cv, s = "lambda.min"){
+  b <- coef(cv, s = s)
+  tibble(feature = rownames(b), beta = as.numeric(b)) %>%
+    filter(feature != "(Intercept)", beta != 0) %>%
+    arrange(desc(abs(beta)))
+}
+
+score_from_coef <- function(X, coef_tbl){
+  b <- coef_tbl$beta; names(b) <- coef_tbl$feature
+  feats <- intersect(colnames(X), names(b))
+  as.numeric(X[, feats, drop = FALSE] %*% b[feats])
+}
+
+pdff_coef_main <- coef_nonzero(cv_pdff, s = "lambda.min")
+message("PDFF_index nonzero features (lambda.min): ", nrow(pdff_coef_main))
+print(pdff_coef_main)
+
+pdff_df$PDFF_index <- NA_real_
+pdff_df$PDFF_index[pdff_xy$keep] <- as.numeric(scale(score_from_coef(X_pdff, pdff_coef_main)))
+
+write.csv(
+  pdff_coef_main,
+  file = file.path(out_dir, "PDFF_index_coeff_PDFFONLY_lambda.min.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  tibble(metabolite_label = pdff_xy$kept_mets),
+  file = file.path(out_dir, "PDFF_metabolites_kept_minNonNA10_PDFFONLY.csv"),
+  row.names = FALSE
+)
+
+
+
+#---- FIgures for PDFF_index; PDFF-only features
+# A) S1：PDFF coefficient path + CV curve（unchanged, just checking the object name）
+library(glmnet)
+
+# S1-1: coefficient path
+fit_path_pdff <- cv_pdff$glmnet.fit
+plot(fit_path_pdff, xvar = "lambda", label = FALSE)
+abline(v = log(cv_pdff$lambda.min), lwd = 2, lty = 1)
+abline(v = log(cv_pdff$lambda.1se), lwd = 2, lty = 2)
+legend("topright",
+       legend = c("lambda.min", "lambda.1se"),
+       lty = c(1, 2), lwd = 2, bty = "n")
+
+# Output
+tif_path <- file.path(out_dir, "PDFF_coefficient path")
+
+graph2tif(x = NULL, file = tif_path, font = "Arial", cairo = TRUE,
+          width = 4.5, height = 4, bg = "transparent")
+graph2svg(x = NULL, file = tif_path, font = "Arial", cairo = TRUE,
+          width = 4.5, height = 4, bg = "transparent")
+
+
+# S1-2: CV curve
+plot(cv_pdff)
+abline(v = log(cv_pdff$lambda.min), lwd = 2, lty = 1)
+abline(v = log(cv_pdff$lambda.1se), lwd = 2, lty = 2)
+legend("topright",
+       legend = c("lambda.min", "lambda.1se"),
+       lty = c(1, 2), lwd = 2, bty = "n")
+
+
+# B) Figure: bar plot of non-zero coefficients at λmin (currently only 4 covariates)
+library(dplyr)
+library(ggplot2)
+
+coef_plot_pdff <- pdff_coef_main %>%
+  mutate(
+    feature = gsub("^`|`$", "", feature),
+    feature = recode(feature, AdultChildChild = "CohortChild"),
+    direction = ifelse(beta > 0, "Positive", "Negative")
+  ) %>%
+  arrange(beta) %>%
+  mutate(feature = factor(feature, levels = feature))
+
+p_pdff_coef <- ggplot(coef_plot_pdff, aes(x = feature, y = beta, fill = direction)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = c(Positive = "#D7191C", Negative = "#2C7BB6")) +
+  theme_classic(base_size = 15) +
+  theme(
+    plot.title   = element_text(size = 15),
+    axis.title.x = element_text(size = 15),
+    axis.title.y = element_text(size = 15),
+    axis.text.x  = element_text(size = 15),
+    axis.text.y  = element_text(size = 15),
+    legend.title = element_text(size = 15),
+    legend.text  = element_text(size = 15)
+  ) +
+  labs(
+    x = NULL,
+    y = "Elastic Net coefficient (lambda.min)",
+    title = "PDFF Elastic Net selected features (covariates only)",
+    fill = NULL
+  )
+
+p_pdff_coef
+
+# Output
+tif_path <- file.path(out_dir, "PDFF_Selected features_1")
+
+graph2tif(x = p_pdff_coef, file = tif_path, font = "Arial", cairo = TRUE,
+          width = 6, height = 3.2, bg = "transparent")
+graph2svg(x = p_pdff_coef, file = tif_path, font = "Arial", cairo = TRUE,
+          width = 6, height = 3.2, bg = "transparent")
+
+
+# C) Figure: PDFF_index vs outcome (add r / p, correlation only)
+pdff_plot_df <- pdff_df %>%
+  mutate(PDFF_outcome = .data[[pdff_outcome_col]])
+
+cc <- complete.cases(pdff_plot_df[, c("PDFF_index", "PDFF_outcome")])
+ct <- cor.test(pdff_plot_df$PDFF_index[cc], pdff_plot_df$PDFF_outcome[cc], method = "pearson")
+
+lab_txt <- paste0(
+  "r = ", sprintf("%.3f", unname(ct$estimate)),
+  "\n", "p = ", format.pval(ct$p.value, digits = 2, eps = 1e-3),
+  "\n", "n = ", sum(cc)
+)
+
+p_pdff_scatter <- ggplot(pdff_plot_df[cc, , drop = FALSE],
+                         aes(x = PDFF_index, y = PDFF_outcome)) +
+  geom_point(size = 2, alpha = 0.75) +
+  geom_smooth(method = "lm", se = TRUE, color = "#2C7BB6") +
+  annotate(
+    "label",
+    x = -Inf, y = Inf,
+    hjust = -0.02, vjust = 1.02,
+    label = lab_txt,
+    size = 4.6,
+    label.size = 0.4,
+    label.padding = unit(0.45, "lines"),
+    lineheight = 1.05
+  ) +
+  theme_classic(base_size = 15) +
+  theme(
+    plot.title   = element_text(size = 15),
+    axis.title.x = element_text(size = 15),
+    axis.title.y = element_text(size = 15),
+    axis.text.x  = element_text(size = 15),
+    axis.text.y  = element_text(size = 15)
+  ) +
+  labs(
+    x = "PDFF index(z)-covariates only",
+    y = pdff_outcome_col,
+    title = "PDFF index vs BAT activity"
+  )
+
+p_pdff_scatter
+
+# Output
+tif_path <- file.path(out_dir, "PDFF_index-BATactivity")
+
+graph2tif(x = NULL, file = tif_path, font = "Arial", cairo = TRUE,
+          width = 4, height = 3.5, bg = "transparent")
+graph2svg(x = NULL, file = tif_path, font = "Arial", cairo = TRUE,
+          width = 4, height = 3.5, bg = "transparent")
+
+
+# D) S2: Bootstrap stability (PDFF, showing covariate stability + Top 15)
+set.seed(123)
+B <- 100
+sel_list <- vector("list", B)
+
+for(b in seq_len(B)){
+  idx <- sample(seq_len(nrow(X_pdff)), replace = TRUE)
+  
+  cv_b <- cv.glmnet(
+    x = X_pdff[idx, , drop = FALSE],
+    y = y_pdff[idx],
+    alpha = ENET_ALPHA,
+    standardize = FALSE,
+    penalty.factor = penalty_pdff
+  )
+  
+  beta <- coef(cv_b, s = "lambda.min")
+  feats <- rownames(beta)[as.vector(beta != 0)]
+  feats <- setdiff(feats, "(Intercept)")
+  feats <- gsub("^`|`$", "", feats)
+  sel_list[[b]] <- feats
+}
+
+all_feats <- sort(unique(unlist(sel_list)))
+sel_mat <- matrix(0, nrow = B, ncol = length(all_feats))
+colnames(sel_mat) <- all_feats
+for(b in seq_len(B)){
+  sel_mat[b, colnames(sel_mat) %in% sel_list[[b]]] <- 1
+}
+
+stab <- sort(colMeans(sel_mat), decreasing = TRUE)
+stab_df <- data.frame(feature = names(stab), freq = as.numeric(stab))
+
+# Mark covariates (using cov_cols_in_X_pdff + your additional AdultChildChild)
+cov_like <- unique(c(gsub("^`|`$", "", cov_cols_in_X_pdff), "AdultChildChild"))
+stab_plot <- stab_df %>%
+  mutate(type = ifelse(feature %in% cov_like, "Covariate", "Metabolite")) %>%
+  arrange(desc(freq)) %>%
+  slice_head(n = 15)
+
+p_pdff_stab <- ggplot(stab_plot,
+                      aes(x = reorder(feature, freq), y = freq, fill = type)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey60") +
+  coord_flip() +
+  scale_fill_manual(values = c(Covariate = "#6BAED6", Metabolite = "#969696")) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title   = element_text(size = 13),
+    axis.title.x = element_text(size = 13),
+    axis.title.y = element_text(size = 13),
+    axis.text.x  = element_text(size = 13),
+    axis.text.y  = element_text(size = 13),
+    legend.title = element_text(size = 13),
+    legend.text  = element_text(size = 13)
+  ) +
+  labs(
+    x = NULL,
+    y = "Selection frequency (bootstrap, B = 100, λmin)",
+    title = "Bootstrap stability (PDFF Elastic Net)",
+    fill = NULL
+  )
+
+p_pdff_stab
+
+# Output
+tif_path <- file.path(out_dir, "PDFF_Selection frequency")
+
+graph2tif(x = NULL, file = tif_path, font = "Arial", cairo = TRUE,
+          width = 8, height = 4.5, bg = "transparent")
+graph2svg(x = NULL, file = tif_path, font = "Arial", cairo = TRUE,
+          width = 8, height = 4.5, bg = "transparent")
+#------ VIP2 done -----
+
+
+
+
+
+
+
+
+
+
+
+## VIP-4
+## =========================
+## Adult data: n≈60 Nested Cross-Validation (CV) + permutation + stability analysis; inputs are all metabolites
+## =========================
+
+# Your overall workflow is:
+# Nested CV（prevent information leakage）
+# Dynamic screening（high-dimensional → low-dimensional）
+# Stability-based panel selection
+# lambda.min vs lambda.1se comparison
+# final index using the full sample
+# validation with covariate adjustment
+
+
+# Nested CV（dynamic screening）+ coefficient stability
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(glmnet)
+})
+
+# ---------- helpers ----------
+numify <- function(x){
+  if (is.factor(x)) x <- as.character(x)
+  if (is.character(x)) {
+    x <- trimws(x)
+    x[x %in% c("", "NA", "NaN", "null", "NULL")] <- NA
+  }
+  suppressWarnings(as.numeric(x))
+}
+
+# train-only median impute + zscore
+prep_x_train_test <- function(tr, te, mets){
+  Xtr <- as.matrix(tr[, mets, drop=FALSE])
+  Xte <- as.matrix(te[, mets, drop=FALSE])
+  
+  # impute by train medians
+  med <- apply(Xtr, 2, function(x){
+    if(all(is.na(x))) NA_real_ else median(x, na.rm=TRUE)
+  })
+  for (j in seq_along(mets)){
+    if (is.na(med[j])) {  # all-NA column: set directly to 0 (equivalent to zero contribution after z-scoring)
+      Xtr[, j] <- 0
+      Xte[, j] <- 0
+    } else {
+      Xtr[is.na(Xtr[, j]), j] <- med[j]
+      Xte[is.na(Xte[, j]), j] <- med[j]
+    }
+  }
+  
+  # zscore by train mean/sd
+  mu <- colMeans(Xtr)
+  sdv <- apply(Xtr, 2, sd)
+  sdv[is.na(sdv) | sdv == 0] <- 1
+  
+  Xtr_z <- sweep(sweep(Xtr, 2, mu, "-"), 2, sdv, "/")
+  Xte_z <- sweep(sweep(Xte, 2, mu, "-"), 2, sdv, "/")
+  
+  list(Xtr = Xtr_z, Xte = Xte_z, mu = mu, sd = sdv, med = med)
+}
+
+# --- univariate screening in TRAIN only (adjusting covars) ---
+screen_mets_train <- function(tr_df, outcome_col, covars, metab_cols,
+                              method = c("p", "topk"),
+                              p_thresh = 0.05,
+                              topk = 10,
+                              min_n = 25){
+  method <- match.arg(method)
+  
+  keep_cols <- unique(c(outcome_col, covars, metab_cols))
+  tr <- tr_df[, keep_cols, drop=FALSE]
+  
+  tr[[outcome_col]] <- numify(tr[[outcome_col]])
+  
+  # helper to backtick any column name safely
+  bt <- function(x) paste0("`", x, "`")
+  
+  get_p <- function(m){
+    dfm <- tr[, c(outcome_col, covars, m), drop=FALSE]
+    dfm[[m]] <- numify(dfm[[m]])
+    dfm <- dfm[complete.cases(dfm), , drop=FALSE]
+    if (nrow(dfm) < min_n) return(NA_real_)
+    
+    # build formula as string to safely handle spaces/hyphens
+    rhs <- c(bt(m), bt(covars))
+    fml_str <- paste(bt(outcome_col), "~", paste(rhs, collapse = " + "))
+    fit <- try(lm(as.formula(fml_str), data = dfm), silent = TRUE)
+    if (inherits(fit, "try-error")) return(NA_real_)
+    
+    coefs <- summary(fit)$coefficients
+    # rowname will be the raw column name (not backticked) in most cases
+    if (!m %in% rownames(coefs)) {
+      # fallback: try matching backticked name
+      if (!bt(m) %in% rownames(coefs)) return(NA_real_)
+      return(unname(coefs[bt(m), "Pr(>|t|)"]))
+    }
+    unname(coefs[m, "Pr(>|t|)"])
+  }
+  
+  pvals <- vapply(metab_cols, get_p, numeric(1))
+  out <- data.frame(metabolite = metab_cols, p = pvals) %>%
+    filter(!is.na(p)) %>%
+    arrange(p)
+  
+  if (nrow(out) == 0) return(character(0))
+  
+  if (method == "p"){
+    sel <- out %>% filter(p < p_thresh) %>% pull(metabolite)
+    if (length(sel) < 3){
+      sel <- head(out$metabolite, min(topk, nrow(out)))
+    }
+  } else {
+    sel <- head(out$metabolite, min(topk, nrow(out)))
+  }
+  
+  sel
+}
+
+
+# ---------- main nested CV with dynamic screening ----------
+nested_cv_enet_dynamic_screen <- function(
+    df,
+    outcome_col,
+    covars,
+    metab_cols_all,          # all candidate metabolites you allow screening over
+    alpha = 0.2,             # your ENET_ALPHA
+    K = 5,
+    R = 50,
+    screen_method = c("topk","p"),
+    p_thresh = 0.05,
+    topk = 10,
+    lambda_choice = c("1se","min"),
+    seed = 1
+){
+  screen_method <- match.arg(screen_method)
+  lambda_choice <- match.arg(lambda_choice)
+  
+  set.seed(seed)
+  
+  # keep and clean minimal columns
+  dat0 <- df %>%
+    select(all_of(c(outcome_col, covars, metab_cols_all))) %>%
+    mutate(across(all_of(metab_cols_all), numify))
+  
+  dat0[[outcome_col]] <- numify(dat0[[outcome_col]])
+  dat0 <- dat0 %>% filter(!is.na(.data[[outcome_col]]))
+  
+  n <- nrow(dat0)
+  if (n < K*2) stop("Too few samples for chosen K.")
+  
+  make_folds <- function(n, K) sample(rep(1:K, length.out = n))
+  
+  perf_list <- list()
+  coef_list <- list()
+  screen_list <- list()
+  
+  for (r in seq_len(R)){
+    fold_id <- make_folds(n, K)
+    
+    for (k in 1:K){
+      idx_te <- which(fold_id == k)
+      idx_tr <- setdiff(seq_len(n), idx_te)
+      
+      tr0 <- dat0[idx_tr, , drop=FALSE]
+      te0 <- dat0[idx_te, , drop=FALSE]
+      
+      # ---- dynamic screening within TRAIN only ----
+      mets_sel <- screen_mets_train(
+        tr_df = tr0,
+        outcome_col = outcome_col,
+        covars = covars,
+        metab_cols = metab_cols_all,
+        method = screen_method,
+        p_thresh = p_thresh,
+        topk = topk,
+        min_n = 25
+      )
+      
+      screen_list[[length(screen_list)+1]] <- data.frame(rep=r, fold=k, n_selected=length(mets_sel))
+      
+      # if nothing selected, skip fold
+      if (length(mets_sel) == 0) next
+      
+      # ---- build X/y for glmnet on TRAIN ----
+      tr <- tr0
+      te <- te0
+      
+      # prepare standardized X using TRAIN-only stats
+      pp <- prep_x_train_test(tr, te, mets_sel)
+      Xtr <- pp$Xtr
+      Xte <- pp$Xte
+      ytr <- numify(tr[[outcome_col]])
+      yte <- numify(te[[outcome_col]])
+      
+      # inner CV choose lambda on TRAIN only
+      cvfit <- cv.glmnet(
+        x = Xtr, y = ytr,
+        family = "gaussian",
+        alpha = alpha,
+        standardize = FALSE
+      )
+      lam <- if (lambda_choice == "1se") cvfit$lambda.1se else cvfit$lambda.min
+      
+      b <- as.matrix(coef(cvfit, s = lam))  # includes intercept
+      b_mets <- as.numeric(b[mets_sel, 1])
+      names(b_mets) <- mets_sel
+      n_enet_nonzero <- sum(b_mets != 0)
+      
+      
+      # L1 normalize metabolite weights
+      if (all(b_mets == 0)){
+        w <- rep(0, length(mets_sel)); names(w) <- mets_sel
+      } else {
+        w <- b_mets / sum(abs(b_mets))
+      }
+      
+      # compute index scores
+      idx_tr_score <- as.numeric(Xtr %*% w)
+      idx_te_score <- as.numeric(Xte %*% w)
+      
+      # ---- build train/test eval frames with index_z (standardize using TRAIN only) ----
+      mu_i <- mean(idx_tr_score); sd_i <- sd(idx_tr_score); if (sd_i == 0) sd_i <- 1
+      
+      tr_eval <- tr
+      te_eval <- te
+      tr_eval$index_z <- (idx_tr_score - mu_i) / sd_i
+      te_eval$index_z <- (idx_te_score - mu_i) / sd_i
+      
+      # ---- FIX: drop covariates that have <2 levels in TRAIN ----
+      covars_use <- covars
+      
+      for (cv in covars_use){
+        if (is.character(tr_eval[[cv]]) || is.factor(tr_eval[[cv]])){
+          tr_eval[[cv]] <- factor(tr_eval[[cv]])
+          te_eval[[cv]] <- factor(te_eval[[cv]], levels = levels(tr_eval[[cv]]))
+          if (nlevels(tr_eval[[cv]]) < 2){
+            covars_use <- setdiff(covars_use, cv)
+          }
+        }
+      }
+      
+      # build formula with remaining covariates
+      fml <- reformulate(c("index_z", covars_use), response = outcome_col)
+      
+      # fit on TRAIN, predict on TEST (true out-of-sample)
+      fit_train <- lm(fml, data = tr_eval)
+      pred <- predict(fit_train, newdata = te_eval)
+      r_s <- suppressWarnings(cor(te_eval[[outcome_col]], pred, method="spearman", use="complete.obs"))
+      mae <- mean(abs(te_eval[[outcome_col]] - pred), na.rm=TRUE)
+      
+      rmse <- sqrt(mean((te_eval[[outcome_col]] - pred)^2, na.rm=TRUE))
+      r2   <- 1 - sum((te_eval[[outcome_col]] - pred)^2, na.rm=TRUE) /
+        sum((te_eval[[outcome_col]] - mean(te_eval[[outcome_col]], na.rm=TRUE))^2, na.rm=TRUE)
+      
+      # also record how many covars were used
+      n_covars_used <- length(covars_use)
+      
+      perf_list[[length(perf_list)+1]] <- data.frame(
+        rep=r, fold=k,
+        n_train=nrow(tr), n_test=nrow(te),
+        n_screened=length(metab_cols_all),
+        n_selected=length(mets_sel),   # always 20 (screening)
+        n_enet_nonzero=n_enet_nonzero,        # ✅ true number of non-zero ENet features
+        n_covars_used=n_covars_used,          # ✅ how many covariates were actually used in this fold
+        rmse=rmse, r2=r2,
+        mae=mae, spearman=r_s
+      )
+      
+      # store coefficients for stability (on screened set)
+      coef_list[[length(coef_list)+1]] <- data.frame(
+        rep=r, fold=k,
+        metabolite=mets_sel,
+        beta=b_mets,
+        weight_L1=w
+      )
+    }
+  }
+  
+  perf <- bind_rows(perf_list)
+  coefs <- bind_rows(coef_list)
+  screen_info <- bind_rows(screen_list)
+  
+  # stability summary (on metabolites that ever appeared)
+  perf <- bind_rows(perf_list)
+  coefs <- bind_rows(coef_list)
+  screen_info <- bind_rows(screen_list)
+  
+  # Fix the denominator as the total number of folds (K*R), to avoid next/skip affecting frequency interpretation
+  n_folds_total <- K * R
+  
+  stability <- coefs %>%
+    mutate(
+      selected = (beta != 0)
+    ) %>%
+    group_by(metabolite) %>%
+    summarise(
+      screen_freq = n() / n_folds_total,                       # frequency of entering the topk (counted across all folds)
+      select_given_screened = mean(selected, na.rm = TRUE),    # conditional probability: probability of being retained by ENet after entering the topk
+      select_overall = sum(selected, na.rm = TRUE) / n_folds_total, # overall retention frequency, counted across all folds
+      sign_consistency = {
+        bsel <- beta[selected]
+        if (length(bsel) == 0) NA_real_ else max(mean(bsel > 0), mean(bsel < 0))
+      },
+      beta_median = median(beta[selected], na.rm = TRUE),
+      beta_IQR    = IQR(beta[selected], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(select_overall), desc(screen_freq))
+  
+  list(perf = perf, coefs = coefs, stability = stability, screen_info = screen_info)
+  
+  
+}
+
+# ---------- permutation wrapper ----------
+perm_test_nested_dynamic <- function(
+    df, outcome_col, covars, metab_cols_all,
+    alpha = 0.2, K = 5, R = 30,
+    screen_method = "topk", p_thresh = 0.05, topk = 10, # or topk = 15
+    lambda_choice = "1se",
+    B = 200,
+    seed = 1
+){
+  set.seed(seed)
+  
+  obs <- nested_cv_enet_dynamic_screen(
+    df=df, outcome_col=outcome_col, covars=covars, metab_cols_all=metab_cols_all,
+    alpha=alpha, K=K, R=R,
+    screen_method=screen_method, p_thresh=p_thresh, topk=topk,
+    lambda_choice=lambda_choice, seed=seed
+  )
+  obs_r2 <- median(obs$perf$r2, na.rm=TRUE)
+  
+  perm_r2 <- numeric(B)
+  for (b in 1:B){
+    dfp <- df
+    dfp[[outcome_col]] <- sample(dfp[[outcome_col]])
+    tmp <- nested_cv_enet_dynamic_screen(
+      df=dfp, outcome_col=outcome_col, covars=covars, metab_cols_all=metab_cols_all,
+      alpha=alpha, K=K, R=R,
+      screen_method=screen_method, p_thresh=p_thresh, topk=topk,
+      lambda_choice=lambda_choice, seed=seed + b
+    )
+    perm_r2[b] <- median(tmp$perf$r2, na.rm=TRUE)
+  }
+  
+  p_emp <- (sum(perm_r2 >= obs_r2) + 1) / (B + 1)
+  
+  list(
+    observed = obs,
+    observed_median_r2 = obs_r2,
+    perm_median_r2 = perm_r2,
+    p_empirical = p_emp
+  )
+}
+
+
+
+
+
+######## Run on Adult data (using your current variable names)
+ENET_ALPHA <- 0.2
+adult_covars <- c("Age","Sex","BodyFatPercent")
+
+# All your metabolite columns (it is recommended to use the full metabolite set rather than fixing 11 first)
+# 0) Automatically identify metabolite columns (PDFF-only)
+PDFF=read.csv('C:/BaiduSyncdisk/R analysis/MetabolomicsKM/Data from Dennis/train80/PDFF_M_F_P_clean_PETnames_v2.csv',  
+              header = T, stringsAsFactors = FALSE,
+              check.names = FALSE)
+dim(PDFF)
+PDFF[1:5, 1:20]
+
+non_metab <- c(
+  "SampleNum","Type","Study_ID",
+  "Age","Sex","SexNam","AdultChild","BodyFatPercent",
+  "Precold_SCV_FF","SCV_FF_Reduction","SCV_Percentchange_PDFF",
+  "Precold_Liver_FF",
+  "lab_glucose_bl","Insulin_mUL",
+  "lab_lipids_chol","lab_lipids_tgs","lab_lipids_hdl","lab_lipids_ldl"
+)
+
+metabolite_cols <- setdiff(colnames(PDFF), non_metab)
+head(metabolite_cols)
+
+cat("Metabolite columns detected:", length(metabolite_cols), "\n")
+head(metabolite_cols, 20)
+
+metab_cols_all <- metabolite_cols   # the 105 you identified automatically before
+
+# 1) nested CV + stability (dynamic screening inside train)
+res_dyn <- nested_cv_enet_dynamic_screen(
+  df = adult_df,
+  outcome_col = pdff_outcome_col,
+  covars = adult_covars,
+  metab_cols_all = metab_cols_all,
+  alpha = ENET_ALPHA,
+  K = 5,
+  R = 50,
+  screen_method = "topk",    # topk is recommended because it is more stable
+  topk = 10,
+  lambda_choice = "min",
+  seed = 1
+)
+
+summary(res_dyn$perf$n_enet_nonzero)
+summary(res_dyn$perf$r2)
+table(res_dyn$perf$n_enet_nonzero)
+summary(res_dyn$perf$rmse)
+table(res_dyn$coefs$metabolite[res_dyn$coefs$beta!=0])
+
+
+# panel construction strategy
+panel_core <- names(which(
+  table(res_dyn$coefs$metabolite[res_dyn$coefs$beta != 0]) >= 50 # 50/250 = 20%
+))
+panel_core
+
+
+# 2) permutation test (first run a smaller version to see the trend), e.g., R = 5/10, B = 20/50
+res_perm_dyn <- perm_test_nested_dynamic(
+  df = adult_df,
+  outcome_col = pdff_outcome_col,
+  covars = adult_covars,
+  metab_cols_all = metab_cols_all,
+  alpha = ENET_ALPHA,
+  K = 5,
+  R = 10, #R = 30
+  screen_method = "topk",
+  topk = 10,
+  lambda_choice = "min",
+  B = 50, #B = 200
+  seed = 1
+)
+
+res_perm_dyn$observed_median_r2
+quantile(res_perm_dyn$perm_median_r2, c(0.5, 0.9, 0.95))
+res_perm_dyn$p_empirical
+
+
+summary(adult_df[[pdff_outcome_col]])
+summary(res_dyn$perf$n_enet_nonzero)
+table(res_dyn$perf$n_enet_nonzero)
+
+
+
+
+#---------- Refit a 'final index' based on panel_core (no longer using CV, use all Adult data)
+# First define panel_core (based on a stability threshold)
+# ---- panel_core: stability-based ----
+tab_nonzero <- table(res_dyn$coefs$metabolite[res_dyn$coefs$beta != 0])
+
+panel_core <- names(tab_nonzero[tab_nonzero >= 50])
+panel_core
+length(panel_core)
+
+
+# Refit Elastic Net on the full Adult sample
+# 1️⃣ Build X / y (metabolites only, no covariates)
+library(glmnet)
+
+adult_df_final <- adult_df
+
+# outcome
+y0 <- numify(adult_df_final[[pdff_outcome_col]])
+
+# metabolites
+adult_df_final[, panel_core] <- lapply(adult_df_final[, panel_core, drop=FALSE], numify)
+X_raw0 <- as.matrix(adult_df_final[, panel_core, drop=FALSE])
+
+# ---- FIX 1: drop rows with missing y ----
+keep <- which(!is.na(y0))
+y <- y0[keep]
+X_raw <- X_raw0[keep, , drop=FALSE]
+
+# (optional but recommended) drop rows where any panel metabolite is NA BEFORE impute?
+# not necessary; we will impute below.
+
+# ---- FIX 2: impute using Adult(non-missing y) medians ----
+med <- apply(X_raw, 2, function(x) median(x, na.rm=TRUE))
+for(j in seq_along(panel_core)){
+  X_raw[is.na(X_raw[, j]), j] <- med[j]
+}
+
+# ---- FIX 3: check y not constant ----
+if (sd(y, na.rm=TRUE) == 0) stop("Outcome is constant after filtering; cannot fit glmnet.")
+
+# z-score
+X <- scale(X_raw)
+
+set.seed(1)
+cvfit_final <- cv.glmnet(
+  x = X,
+  y = y,
+  family = "gaussian",
+  alpha = ENET_ALPHA,   # 0.2
+  standardize = FALSE,
+  nfolds = 5
+)
+
+lambda_final <- cvfit_final$lambda.min   # or use lambda.1se for greater stability
+coef_mat <- as.matrix(coef(cvfit_final, s = lambda_final))
+
+beta_met <- coef_mat[panel_core, 1]
+w_final <- beta_met / sum(abs(beta_met))
+
+final_weights <- data.frame(
+  metabolite = panel_core,
+  beta_raw   = beta_met,
+  weight_L1  = w_final
+)
+
+final_weights
+
+write.csv(
+  final_weights,
+  file = file.path(out_dir, "PDFF_Adult_BAT_index_final_weights.csv"),
+  row.names = FALSE
+)
+
+
+# Calculate the Final PDFF Adult BAT Index
+adult_df_final$PDFF_Adult_BAT_index_raw <- NA_real_
+adult_df_final$PDFF_Adult_BAT_index_z   <- NA_real_
+
+adult_df_final$PDFF_Adult_BAT_index_raw[keep] <- as.numeric(X %*% w_final)
+adult_df_final$PDFF_Adult_BAT_index_z[keep]   <- as.numeric(scale(adult_df_final$PDFF_Adult_BAT_index_raw[keep]))
+
+summary(adult_df_final$PDFF_Adult_BAT_index_z)
+
+
+
+# Formally validate the model (the main result in your paper)
+# Model form (very standard):
+# SCV_Percentchange_PDFF ~ BAT_index + Age + Sex + BodyFatPercent
+adult_covars <- c("Age", "Sex", "BodyFatPercent")
+
+cc <- complete.cases(
+  adult_df_final[, c(pdff_outcome_col,
+                     "PDFF_Adult_BAT_index_z",
+                     adult_covars)]
+)
+
+fit_final <- lm(
+  reformulate(
+    c("PDFF_Adult_BAT_index_z", adult_covars),
+    response = pdff_outcome_col
+  ),
+  data = adult_df_final[cc, ]
+)
+
+summary(fit_final)
+
+# Extract coefficients
+coef_table <- as.data.frame(summary(fit_final)$coefficients)
+# Add variable names as a column
+coef_table$Variable <- rownames(coef_table)
+# Reorder columns (optional, nicer format)
+coef_table <- coef_table[, c("Variable", "Estimate", "Std. Error", "t value", "Pr(>|t|)")]
+# Save
+write.csv(coef_table, "fit_final_coefficients_Index_min.csv", row.names = FALSE)
+
+
+
+# Generate an 'active panel' (remove zero weights)
+final_weights_active <- final_weights %>% dplyr::filter(beta_raw != 0)
+final_weights_active
+
+write.csv(
+  final_weights_active,
+  file = file.path(out_dir, "PDFF_Adult_BAT_index_final_weights_active.csv"),
+  )
+
+
+
+
+# Replace lambda.min with lambda.1se and compare again (more stable, less overfitting)
+# Report: min gives better fit, 1se gives a more stable panel
+lambda_final_1se <- cvfit_final$lambda.1se
+coef_mat_1se <- as.matrix(coef(cvfit_final, s = lambda_final_1se))
+beta_met_1se <- coef_mat_1se[panel_core, 1]
+w_final_1se <- beta_met_1se / sum(abs(beta_met_1se))
+data.frame(metabolite=panel_core, beta_raw=beta_met_1se, weight_L1=w_final_1se)
+final_weights_1se <- data.frame(metabolite=panel_core, beta_raw=beta_met_1se, weight_L1=w_final_1se)
+write.csv(
+  final_weights_1se,
+  file = file.path(out_dir, "PDFF_Adult_BAT_index_final_weights_1se.csv"),
+)
+
+
+
+#---------Rebuild the BAT index using the 2-metabolite index from lambda.1se -
+# 1️⃣ Build the 2-metabolite index（lambda.1se）
+## ---- 1. Define the 1se panel ----
+panel_1se <- c("Hexanoyl-L-carnitine", "Palmitoleic acid")
+
+## ---- 2. Prepare data ----
+adult_df_1se <- adult_df
+
+# outcome
+y0 <- numify(adult_df_1se[[pdff_outcome_col]])
+
+# metabolites
+adult_df_1se[, panel_1se] <- lapply(
+  adult_df_1se[, panel_1se, drop = FALSE],
+  numify
+)
+
+X_raw0 <- as.matrix(adult_df_1se[, panel_1se, drop = FALSE])
+
+# drop missing outcome
+keep <- which(!is.na(y0))
+y <- y0[keep]
+X_raw <- X_raw0[keep, , drop = FALSE]
+
+# median impute
+med <- apply(X_raw, 2, function(x) median(x, na.rm = TRUE))
+for(j in seq_along(panel_1se)){
+  X_raw[is.na(X_raw[, j]), j] <- med[j]
+}
+
+# z-score
+X <- scale(X_raw)
+
+## ---- 3. Fit using lambda.1se (already completed; you already have cvfit_final)----
+lambda_1se <- cvfit_final$lambda.1se
+coef_1se   <- as.matrix(coef(cvfit_final, s = lambda_1se))
+
+beta_1se <- coef_1se[panel_1se, 1]
+beta_1se
+
+# 4️⃣ Build index (L1-normalized)
+w_1se <- beta_1se / sum(abs(beta_1se))
+w_1se
+write.csv(
+  w_1se,
+  file = file.path(out_dir, "PDFF_Adult_BAT_index_final_weights_1se_only2Meta_vip.csv"),
+)
+
+
+# 5️⃣ Calculate the index
+adult_df_1se$PDFF_Adult_BAT_index_1se_raw <- NA_real_
+adult_df_1se$PDFF_Adult_BAT_index_1se_z   <- NA_real_
+
+adult_df_1se$PDFF_Adult_BAT_index_1se_raw[keep] <-
+  as.numeric(X %*% w_1se)
+
+adult_df_1se$PDFF_Adult_BAT_index_1se_z[keep] <-
+  as.numeric(scale(adult_df_1se$PDFF_Adult_BAT_index_1se_raw[keep]))
+
+summary(adult_df_1se$PDFF_Adult_BAT_index_1se_z)
+
+
+# II. Covariate-adjusted regression (results you want to write in the paper)
+adult_covars <- c("Age", "Sex", "BodyFatPercent")
+
+cc <- complete.cases(
+  adult_df_1se[, c(
+    pdff_outcome_col,
+    "PDFF_Adult_BAT_index_1se_z",
+    adult_covars
+  )]
+)
+
+fit_1se <- lm(
+  reformulate(
+    c("PDFF_Adult_BAT_index_1se_z", adult_covars),
+    response = pdff_outcome_col
+  ),
+  data = adult_df_1se[cc, ]
+)
+
+summary(fit_final)
+summary(fit_1se)
+
+# Extract coefficients
+coef_table_1se <- as.data.frame(summary(fit_1se)$coefficients)
+# Add variable names
+coef_table_1se$Variable <- rownames(coef_table_1se)
+# Reorder columns
+coef_table_1se <- coef_table_1se[, c("Variable", "Estimate", "Std. Error", "t value", "Pr(>|t|)")]
+# Save
+write.csv(coef_table_1se, "fit_final_coefficients_Index_1se.csv", row.names = FALSE)
+
+
+write.csv(
+  adult_df_1se,
+  file = file.path(out_dir, "PDFF_Adult_BAT_index_weights_1se_only2Meta_vip.csv"),
+)
+
+
+
+## Compare model lambda.min and lambda.1se
+
+## =========================
+## Build publication-ready comparison table
+## =========================
+
+extract_model_info <- function(fit, index_name, model_name){
+  sm <- summary(fit)
+  coef_tab <- as.data.frame(sm$coefficients)
+  
+  # Extract the index row
+  idx_row <- coef_tab[index_name, ]
+  
+  data.frame(
+    Model = model_name,
+    Index = index_name,
+    
+    Beta = idx_row["Estimate"],
+    SE   = idx_row["Std. Error"],
+    t    = idx_row["t value"],
+    P    = idx_row["Pr(>|t|)"],
+    
+    R2       = sm$r.squared,
+    Adj_R2   = sm$adj.r.squared,
+    Residual_SE = sm$sigma,
+    
+    stringsAsFactors = FALSE
+  )
+}
+
+## ---- Extract the two models ----
+res_min <- extract_model_info(
+  fit_final,
+  "PDFF_Adult_BAT_index_z",
+  "Index_min"
+)
+
+res_1se <- extract_model_info(
+  fit_1se,
+  "PDFF_Adult_BAT_index_1se_z",
+  "Index_1se"
+)
+
+res_min$Model <- "Index_min"
+res_1se$Model <- "Index_1se"
+
+compare_table <- rbind(res_min, res_1se)
+
+# Remove row names
+rownames(compare_table) <- NULL
+
+# Rename columns
+colnames(compare_table) <- c(
+  "Model", "Index", "Beta", "SE", "t", "P",
+  "R2", "Adj_R2", "Residual_SE"
+)
+
+# Convert to numeric
+compare_table$Beta <- as.numeric(compare_table$Beta)
+compare_table$SE <- as.numeric(compare_table$SE)
+compare_table$t <- as.numeric(compare_table$t)
+compare_table$P <- as.numeric(compare_table$P)
+compare_table$R2 <- as.numeric(compare_table$R2)
+compare_table$Adj_R2 <- as.numeric(compare_table$Adj_R2)
+compare_table$Residual_SE <- as.numeric(compare_table$Residual_SE)
+
+# Format
+compare_table$Beta <- round(compare_table$Beta, 3)
+compare_table$SE <- round(compare_table$SE, 3)
+compare_table$t <- round(compare_table$t, 3)
+compare_table$P <- signif(compare_table$P, 3)
+compare_table$R2 <- round(compare_table$R2, 3)
+compare_table$Adj_R2 <- round(compare_table$Adj_R2, 3)
+compare_table$Residual_SE <- round(compare_table$Residual_SE, 3)
+
+# Save
+write.csv(compare_table, "BAT_index_model_comparison.csv", row.names = FALSE)
+compare_table
+
+
+
+
+
+
+
+
+###----------- Make figures --------------###
+# ============================================================
+# Textbook pipeline plots for: Nested CV + dynamic screening + stability + permutation + final index
+# Output: TIFF + SVG (same basename)
+# All fonts unified by BASE_FONT
+# Requires objects already in workspace:
+#   res_dyn
+#   (optional) res_perm_dyn
+#   (optional) adult_df_final, fit_final, final_weights
+#   (optional) fit_1se, final_weights_1se
+#   pdff_outcome_col
+#   (optional) out_dir
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(broom)
+})
+
+# -----------------------------
+# Global style + saving helpers
+# -----------------------------
+BASE_FONT <- 15   # <<< change this one line to scale all text
+
+theme_pub <- function(base_size = BASE_FONT){
+  theme_classic(base_size = base_size) +
+    theme(
+      plot.title   = element_text(size = base_size + 1, face = "bold"),
+      axis.title   = element_text(size = base_size),
+      axis.text    = element_text(size = base_size),
+      legend.title = element_text(size = base_size),
+      legend.text  = element_text(size = base_size),
+      strip.text   = element_text(size = base_size, face = "bold"),
+      plot.caption = element_text(size = base_size - 1)
+    )
+}
+
+save_both <- function(plot, filename_base, out_dir,
+                      width = 6, height = 4, units = "in",
+                      dpi = 300, bg = "white"){
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  # TIFF (LZW compressed)
+  ggsave(
+    filename = file.path(out_dir, paste0(filename_base, ".tiff")),
+    plot = plot, width = width, height = height, units = units,
+    dpi = dpi, device = "tiff", compression = "lzw", bg = bg
+  )
+  
+  # SVG (vector)
+  ggsave(
+    filename = file.path(out_dir, paste0(filename_base, ".svg")),
+    plot = plot, width = width, height = height, units = units,
+    device = "svg", bg = bg
+  )
+}
+
+median_iqr_label <- function(x){
+  x <- x[is.finite(x)]
+  if(length(x)==0) return("median [IQR]=NA")
+  sprintf("median [IQR]=%.3f [%.3f, %.3f]", median(x), quantile(x, 0.25), quantile(x, 0.75))
+}
+
+# -----------------------------
+# dirs + checks
+# -----------------------------
+out_dir_plots <- out_dir
+
+stopifnot(exists("res_dyn"))
+stopifnot(all(c("perf","coefs","stability") %in% names(res_dyn)))
+
+# ============================================================
+# 1) Nested CV performance
+# ============================================================
+perf <- res_dyn$perf %>% mutate(iter = paste0("R", rep, "-F", fold))
+COL_FILL <- "#9ECAE1"   # light blue fill
+COL_EDGE <- "#3182BD"   # slightly darker blue border
+
+# 1️⃣ Nested CV R² distribution (light blue histogram)
+p_r2 <- ggplot(perf, aes(x = r2)) +
+  geom_histogram(
+    bins = 30,
+    fill  = COL_FILL,
+    color = COL_EDGE,
+    linewidth = 0.4
+  ) +
+  geom_vline(
+    xintercept = median(perf$r2, na.rm = TRUE),
+    linetype = 2,
+    linewidth = 0.8
+  ) +
+  labs(
+    title = "Nested CV test R² distribution",
+    x = "Test R² (out-of-sample)",
+    y = "Count"
+  ) +
+  annotate(
+    "text",
+    x = median(perf$r2, na.rm = TRUE),
+    y = Inf,
+    vjust = 1.2,
+    hjust = 1.02,
+    label = median_iqr_label(perf$r2),
+    size = BASE_FONT / 3
+  ) +
+  theme_pub(BASE_FONT)
+
+# 2️⃣ Nested CV RMSE distribution (light blue histogram)
+p_rmse <- ggplot(perf, aes(x = rmse)) +
+  geom_histogram(
+    bins = 30,
+    fill  = COL_FILL,
+    color = COL_EDGE,
+    linewidth = 0.4
+  ) +
+  geom_vline(
+    xintercept = median(perf$rmse, na.rm = TRUE),
+    linetype = 2,
+    linewidth = 0.8
+  ) +
+  labs(
+    title = "Nested CV test RMSE distribution",
+    x = "Test RMSE",
+    y = "Count"
+  ) +
+  annotate(
+    "text",
+    x = median(perf$rmse, na.rm = TRUE),
+    y = Inf,
+    vjust = 1.2,
+    hjust = 0.6,
+    label = median_iqr_label(perf$rmse),
+    size = BASE_FONT / 3
+  ) +
+  theme_pub(BASE_FONT)
+
+# 3️⃣ Number of non-zero ENet coefficients (light blue bar plot)
+p_nnz <- ggplot(perf, aes(x = n_enet_nonzero)) +
+  geom_bar(
+    fill  = COL_FILL,
+    color = COL_EDGE,
+    linewidth = 0.4
+  ) +
+  labs(
+    title = "Model sparsity per fold",
+    x = "# non-zero ENet coefficients (after screening)",
+    y = "Count"
+  ) +
+  theme_pub(BASE_FONT)
+
+save_both(p_r2,  "Fig1A_nestedCV_R2_hist_1",   out_dir_plots, width=6, height=4, dpi=300)
+save_both(p_rmse,"Fig1B_nestedCV_RMSE_hist_1", out_dir_plots, width=6.2, height=4, dpi=300)
+save_both(p_nnz, "Fig1C_nestedCV_nonzero_1",   out_dir_plots, width=5, height=4, dpi=300)
+
+
+
+# ============================================================
+# 3) Stability: map + top bar
+# ============================================================
+# Select metabolites to label (consistent with your current approach: Top by select_overall)
+library(ggrepel)
+str(stab)
+top_labs <- stab %>%
+  arrange(desc(select_overall)) %>%
+  head(10) %>%
+  pull(metabolite)
+
+
+stab2 <- stab %>%
+  mutate(
+    metabolite = as.character(metabolite),
+    abs_beta_med = abs(beta_median),
+    is_highlight = metabolite %in% top_labs
+  )
+
+COL_HIGHLIGHT <- "#F4A3A3"   # light red
+COL_BASE      <- "#9E9E9E"   # gray base points (or the blue you already use)
+
+p_stab <- ggplot(stab2, aes(x = screen_freq, y = select_overall)) +
+  
+  # 1️⃣ Base layer: all points (light gray/blue)
+  geom_point(
+    data = subset(stab2, !is_highlight),
+    aes(size = abs_beta_med),
+    color = COL_BASE,
+    alpha = 0.7
+  ) +
+  
+  # 2️⃣ Highlighted points: light red
+  geom_point(
+    data = subset(stab2, is_highlight),
+    aes(size = abs_beta_med),
+    color = COL_HIGHLIGHT
+  ) +
+  
+  # 3️⃣ Non-overlapping labels (only for highlighted points)
+  geom_text_repel(
+    data = subset(stab2, is_highlight),
+    aes(label = metabolite),
+    size = BASE_FONT / 3.3,
+    box.padding = 0.35,
+    point.padding = 0.25,
+    max.overlaps = Inf,
+    segment.color = "grey60"
+  ) +
+  
+  labs(
+    title = "Stability selection map",
+    x = "Screen-in frequency (topk / all folds)",
+    y = "Selection frequency (non-zero / all folds)",
+    size = "|median β|"
+  ) +
+  theme_pub(BASE_FONT)
+
+
+COL_FILL <- "#F4A6A6"   # light red / light pink (ColorBrewer style, safe)
+COL_EDGE <- "#E31A1C"   # dark red border (clear contrast)
+p_stab_bar <- stab %>%
+  arrange(desc(select_overall)) %>%
+  head(20) %>%
+  mutate(metabolite = factor(metabolite, levels = rev(metabolite))) %>%
+  ggplot(aes(x = metabolite, y = select_overall)) +
+  geom_col(
+    fill  = COL_FILL,
+    color = COL_EDGE,
+    linewidth = 0.4
+  ) +
+  coord_flip() +
+  labs(
+    title = "Top 20 metabolites by selection frequency",
+    x = NULL,
+    y = "Selection frequency"
+  ) +
+  theme_pub(BASE_FONT)
+
+
+save_both(p_stab,     "Fig3A_stability_map",   out_dir_plots, width=7.5, height=5.5,   dpi=300)
+save_both(p_stab_bar, "Fig3B_stability_top20", out_dir_plots, width=6.5, height=5.5, dpi=300)
+
+# ============================================================
+# 4) Permutation test
+# ============================================================
+# Unified color palette (can be omitted if already defined globally)
+COL_FILL <- "#A6CEE3"   # light blue
+COL_EDGE <- "#1F78B4"   # dark blue
+
+if(exists("res_perm_dyn")){
+  perm_r2 <- res_perm_dyn$perm_median_r2
+  obs_r2  <- res_perm_dyn$observed_median_r2
+  
+  df_perm <- data.frame(perm_median_r2 = perm_r2)
+  
+  p_perm <- ggplot(df_perm, aes(x = perm_median_r2)) +
+    geom_histogram(
+      bins  = 30,
+      fill  = COL_FILL,
+      color = COL_EDGE,
+      linewidth = 0.4
+    ) +
+    geom_vline(
+      xintercept = obs_r2,
+      linetype = 2,
+      linewidth = 0.6,
+      color = COL_EDGE
+    ) +
+    labs(
+      title = "Permutation test (median test R²)",
+      x = "Permuted median test R²",
+      y = "Count"
+    ) +
+    annotate(
+      "text",
+      x = obs_r2,
+      y = Inf,
+      vjust = 1.2,
+      hjust = 1.02,
+      label = paste0(
+        "Observed median R² = ", round(obs_r2, 3),
+        "\nEmpirical p = ", signif(res_perm_dyn$p_empirical, 3)
+      ),
+      size = BASE_FONT / 3
+    ) +
+    theme_pub(BASE_FONT)
+  
+  save_both(
+    p_perm,
+    "Fig4A_permutation_medianR2",
+    out_dir_plots,
+    width = 6,
+    height = 4,
+    dpi = 300
+  )
+}
+
+
+
+# ============================================================
+# 5) lambda.min vs lambda.1se weight comparison
+# ============================================================
+fw <- NULL
+if(exists("final_weights")){
+  fw <- final_weights %>%
+    mutate(model = "lambda.min") %>%
+    select(metabolite, beta_raw, weight_L1, model)
+}
+fw1 <- NULL
+if(exists("final_weights_1se")){
+  fw1 <- final_weights_1se %>%
+    mutate(model = "lambda.1se") %>%
+    select(metabolite, beta_raw, weight_L1, model)
+}
+
+if(!is.null(fw) || !is.null(fw1)){
+  W <- bind_rows(fw, fw1) %>%
+    mutate(metabolite = as.character(metabolite))
+  
+  p_w <- W %>%
+    group_by(model) %>%
+    arrange(desc(abs(weight_L1)), .by_group = TRUE) %>%
+    ungroup() %>%
+    ggplot(
+      aes(
+        x = reorder(metabolite, abs(weight_L1)),
+        y = weight_L1,
+        fill = model                    # ⭐ key: map fill
+      )
+    ) +
+    geom_col(width = 0.7) +
+    coord_flip() +
+    facet_wrap(~model, ncol = 2, scales = "free_y") +
+    scale_fill_manual(                 # ⭐ manually specify different color palettes
+      values = c(
+        "lambda.1se" = "#9ECAE1",       # light blue（more conservative）
+        "lambda.min" = "#3182BD"        # dark blue（more aggressive）
+      )
+    ) +
+    labs(
+      title = "Final panel weights: lambda.min vs lambda.1se",
+      x = NULL,
+      y = "L1-normalized weight"
+    ) +
+    theme_pub(BASE_FONT) +
+    theme(
+      legend.position = "none"         # facet already indicates this, legend not needed
+    )
+  
+  save_both(
+    p_w,
+    "Fig5A_weights_min_vs_1se",
+    out_dir_plots,
+    width = 9,
+    height = 4,
+    dpi = 300
+  )
+}
+
+
+# ============================================================
+# 6) Final index + adjusted regression (effect plots)
+# ============================================================
+library(dplyr)
+library(ggplot2)
+library(broom)
+
+fmt_p <- function(p){
+  if(is.na(p)) return("p = NA")
+  if(p < 1e-3) return("p < 0.001")
+  paste0("p = ", sprintf("%.3f", p))
+}
+
+# =========================
+# Fig6A-1: lambda.min (adult_df_final + fit_final)
+# =========================
+if(exists("adult_df_final") &&
+   ("PDFF_Adult_BAT_index_z" %in% names(adult_df_final)) &&
+   exists("fit_final")){
+  
+  adult_covars <- c("Age", "Sex", "BodyFatPercent")
+  
+  cc_min <- complete.cases(
+    adult_df_final[, c(pdff_outcome_col, "PDFF_Adult_BAT_index_z", adult_covars)]
+  )
+  df_min <- adult_df_final[cc_min, , drop = FALSE]
+  
+  # r = correlation between index and outcome in the analyzed rows
+  r_min <- suppressWarnings(cor(df_min$PDFF_Adult_BAT_index_z,
+                                df_min[[pdff_outcome_col]],
+                                use = "complete.obs", method = "pearson"))
+  
+  # p = from covariate-adjusted regression (fit_final)
+  tid_min <- broom::tidy(fit_final)
+  p_min <- tid_min$p.value[match("PDFF_Adult_BAT_index_z", tid_min$term)]
+  
+  lab_min <- paste0(
+    "n = ", nrow(df_min), "\n",
+    "r = ", sprintf("%.2f", r_min), "\n",
+    fmt_p(p_min)
+  )
+  
+  p_scatter_min <- ggplot(df_min,
+                          aes(x = PDFF_Adult_BAT_index_z, y = .data[[pdff_outcome_col]])) +
+    geom_point() +
+    geom_smooth(method = "lm", se = TRUE) +
+    annotate(
+      "label",
+      x = -Inf, y = Inf,
+      hjust = -0.02, vjust = 1.02,
+      label = lab_min,
+      size = 4.2,
+      label.size = 0.3,
+      label.padding = unit(0.35, "lines"),
+      lineheight = 1.05
+    ) +
+    labs(title = "Outcome vs final index (lambda.min)",
+         x = "PDFF Adult BAT index (z)",
+         y = "ΔSCV PDFF%") +
+    theme_pub(BASE_FONT)
+  
+  save_both(p_scatter_min, "Fig6A_scatter_outcome_vs_index_min",
+            out_dir_plots, width = 5, height = 3.5, dpi = 300)
+}
+
+# =========================
+# Fig6A-2: lambda.1se (adult_df_1se + fit_1se)
+# =========================
+if(exists("adult_df_1se") &&
+   ("PDFF_Adult_BAT_index_1se_z" %in% names(adult_df_1se)) &&
+   exists("fit_1se")){
+  
+  adult_covars <- c("Age", "Sex", "BodyFatPercent")
+  
+  cc_1se <- complete.cases(
+    adult_df_1se[, c(pdff_outcome_col, "PDFF_Adult_BAT_index_1se_z", adult_covars)]
+  )
+  df_1se <- adult_df_1se[cc_1se, , drop = FALSE]
+  
+  r_1se <- suppressWarnings(cor(df_1se$PDFF_Adult_BAT_index_1se_z,
+                                df_1se[[pdff_outcome_col]],
+                                use = "complete.obs", method = "pearson"))
+  
+  tid_1se <- broom::tidy(fit_1se)
+  p_1se <- tid_1se$p.value[match("PDFF_Adult_BAT_index_1se_z", tid_1se$term)]
+  
+  lab_1se <- paste0(
+    "n = ", nrow(df_1se), "\n",
+    "r = ", sprintf("%.2f", r_1se), "\n",
+    fmt_p(p_1se)
+  )
+  
+  p_scatter_1se <- ggplot(df_1se,
+                          aes(x = PDFF_Adult_BAT_index_1se_z, y = .data[[pdff_outcome_col]])) +
+    geom_point() +
+    geom_smooth(method = "lm", se = TRUE) +
+    annotate(
+      "label",
+      x = -Inf, y = Inf,
+      hjust = -0.02, vjust = 1.02,
+      label = lab_1se,
+      size = 4.2,
+      label.size = 0.3,
+      label.padding = unit(0.35, "lines"),
+      lineheight = 1.05
+    ) +
+    labs(title = "Outcome vs final index (lambda.1se)",
+         x = "PDFF Adult BAT index (z)",
+         y = "ΔSCV PDFF%") +
+    theme_pub(BASE_FONT)
+  
+  save_both(p_scatter_1se, "Fig6A_scatter_outcome_vs_index_1se",
+            out_dir_plots, width = 5, height = 3.5, dpi = 300)
+}
+
+
+
+coef_rows <- list()
+if(exists("fit_final")){
+  coef_rows[[length(coef_rows)+1]] <- broom::tidy(fit_final, conf.int=TRUE) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(model="lambda.min")
+}
+if(exists("fit_1se")){
+  coef_rows[[length(coef_rows)+1]] <- broom::tidy(fit_1se, conf.int=TRUE) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(model="lambda.1se")
+}
+
+if(length(coef_rows) > 0){
+  C <- bind_rows(coef_rows) %>%
+    mutate(
+      model = factor(model, levels = c("lambda.1se", "lambda.min")),
+      term  = factor(term, levels = rev(unique(term)))
+    )
+  
+  p_coef <- ggplot(C, aes(x = estimate, y = term, color = model)) +  # ⭐ color by model
+    geom_vline(xintercept = 0, linetype = 2, color = "grey40") +
+    geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2, linewidth = 0.8) +
+    geom_point(size = 2.2) +
+    facet_wrap(~model, ncol = 2, scales = "free_x") +
+    scale_color_manual(                                      # ⭐ two color palettes
+      values = c(
+        "lambda.1se" = "#F4A6A6",   # light red (more robust)
+        "lambda.min" = "#3182BD"    # dark blue
+      )
+    ) +
+    labs(title = "Covariate-adjusted effects (95% CI)",
+         x = "Beta", y = NULL) +
+    theme_pub(BASE_FONT) +
+    theme(legend.position = "none")                          # facet already indicates this, no legend needed
+  
+  save_both(p_coef, "Fig6B_adjusted_effects_min_vs_1se",
+            out_dir_plots, width = 8, height = 3.5, dpi = 300)
+}
+
+
+
+# ============================================================
+# 7) Export key metrics (quick report)
+# ============================================================
+key_metrics <- data.frame(
+  metric = c("Median test R2", "Median test RMSE", "Median non-zero", "Mean non-zero"),
+  value  = c(
+    median(perf$r2, na.rm=TRUE),
+    median(perf$rmse, na.rm=TRUE),
+    median(perf$n_enet_nonzero, na.rm=TRUE),
+    mean(perf$n_enet_nonzero, na.rm=TRUE)
+  )
+)
+write.csv(key_metrics, file.path(out_dir_plots, "Summary_key_metrics.csv"), row.names=FALSE)
+cat("✅ Saved TIFF + SVG plots to:", out_dir_plots, "\n")
+
+
+
+
+
+
+
+
+
+
+## =========================================================
+## Compare two methods in the SAME repeated nested CV framework
+## Method 1: metabolite-only index + covariates in downstream lm
+## Method 2: covariates + metabolites jointly in glmnet (not good model, I did not use it)
+## =========================================================
+# Run following code after "helper" functions above
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(glmnet)
+})
+
+
+# ---------- helper: prepare covariates using TRAIN only ----------
+prep_covars_train_test <- function(tr, te, covars){
+  if (length(covars) == 0){
+    return(list(
+      Xtr = matrix(nrow = nrow(tr), ncol = 0),
+      Xte = matrix(nrow = nrow(te), ncol = 0),
+      colnames = character(0)
+    ))
+  }
+  
+  tr2 <- tr[, covars, drop = FALSE]
+  te2 <- te[, covars, drop = FALSE]
+  
+  # identify numeric vs categorical
+  is_num <- vapply(tr2, function(x) {
+    is.numeric(x) || is.integer(x)
+  }, logical(1))
+  
+  num_covars <- names(is_num)[is_num]
+  cat_covars <- names(is_num)[!is_num]
+  
+  # numeric: median impute + z-score using TRAIN only
+  Xtr_num <- NULL
+  Xte_num <- NULL
+  if (length(num_covars) > 0){
+    Xtr_num0 <- as.data.frame(tr2[, num_covars, drop = FALSE])
+    Xte_num0 <- as.data.frame(te2[, num_covars, drop = FALSE])
+    
+    for (v in num_covars){
+      Xtr_num0[[v]] <- numify(Xtr_num0[[v]])
+      Xte_num0[[v]] <- numify(Xte_num0[[v]])
+      
+      med <- median(Xtr_num0[[v]], na.rm = TRUE)
+      if (is.na(med)) med <- 0
+      
+      Xtr_num0[[v]][is.na(Xtr_num0[[v]])] <- med
+      Xte_num0[[v]][is.na(Xte_num0[[v]])] <- med
+      
+      mu <- mean(Xtr_num0[[v]], na.rm = TRUE)
+      sdv <- sd(Xtr_num0[[v]], na.rm = TRUE)
+      if (is.na(sdv) || sdv == 0) sdv <- 1
+      
+      Xtr_num0[[v]] <- (Xtr_num0[[v]] - mu) / sdv
+      Xte_num0[[v]] <- (Xte_num0[[v]] - mu) / sdv
+    }
+    
+    Xtr_num <- as.matrix(Xtr_num0)
+    Xte_num <- as.matrix(Xte_num0)
+  } else {
+    Xtr_num <- matrix(nrow = nrow(tr), ncol = 0)
+    Xte_num <- matrix(nrow = nrow(te), ncol = 0)
+  }
+  
+  # categorical: train levels only, one-hot encoding
+  Xtr_cat <- NULL
+  Xte_cat <- NULL
+  if (length(cat_covars) > 0){
+    tr_cat <- tr2[, cat_covars, drop = FALSE]
+    te_cat <- te2[, cat_covars, drop = FALSE]
+    
+    for (v in cat_covars){
+      tr_cat[[v]] <- factor(tr_cat[[v]])
+      te_cat[[v]] <- factor(te_cat[[v]], levels = levels(tr_cat[[v]]))
+    }
+    
+    mm_tr <- model.matrix(~ . , data = tr_cat)
+    mm_te <- model.matrix(~ . , data = te_cat)
+    
+    # remove intercept
+    if ("(Intercept)" %in% colnames(mm_tr)) {
+      mm_tr <- mm_tr[, setdiff(colnames(mm_tr), "(Intercept)"), drop = FALSE]
+    }
+    if ("(Intercept)" %in% colnames(mm_te)) {
+      mm_te <- mm_te[, setdiff(colnames(mm_te), "(Intercept)"), drop = FALSE]
+    }
+    
+    # align columns
+    all_cols <- union(colnames(mm_tr), colnames(mm_te))
+    add_missing_cols <- function(M, all_cols){
+      miss <- setdiff(all_cols, colnames(M))
+      if (length(miss) > 0){
+        M2 <- matrix(0, nrow = nrow(M), ncol = length(miss))
+        colnames(M2) <- miss
+        M <- cbind(M, M2)
+      }
+      M[, all_cols, drop = FALSE]
+    }
+    
+    Xtr_cat <- add_missing_cols(mm_tr, all_cols)
+    Xte_cat <- add_missing_cols(mm_te, all_cols)
+    
+    # NA in test due to unseen level -> 0
+    Xte_cat[is.na(Xte_cat)] <- 0
+  } else {
+    Xtr_cat <- matrix(nrow = nrow(tr), ncol = 0)
+    Xte_cat <- matrix(nrow = nrow(te), ncol = 0)
+  }
+  
+  Xtr <- cbind(Xtr_num, Xtr_cat)
+  Xte <- cbind(Xte_num, Xte_cat)
+  
+  if (is.null(dim(Xtr))) Xtr <- matrix(Xtr, nrow = nrow(tr))
+  if (is.null(dim(Xte))) Xte <- matrix(Xte, nrow = nrow(te))
+  
+  list(
+    Xtr = Xtr,
+    Xte = Xte,
+    colnames = colnames(Xtr)
+  )
+}
+
+
+# ---------- helper: metric summary ----------
+summarize_perf <- function(df, method_name){
+  data.frame(
+    method = method_name,
+    n_folds = nrow(df),
+    median_R2   = median(df$r2, na.rm = TRUE),
+    mean_R2     = mean(df$r2, na.rm = TRUE),
+    median_RMSE = median(df$rmse, na.rm = TRUE),
+    mean_RMSE   = mean(df$rmse, na.rm = TRUE),
+    median_MAE  = median(df$mae, na.rm = TRUE),
+    mean_MAE    = mean(df$mae, na.rm = TRUE)
+  )
+}
+
+
+# ---------- main comparison function ----------
+compare_two_methods_nested_cv <- function(
+    df,
+    outcome_col,
+    covars,
+    metab_cols_all,
+    alpha = 0.2,
+    K = 5,
+    R = 30,
+    screen_method = c("topk", "p"),
+    p_thresh = 0.05,
+    topk = 10,
+    lambda_choice = c("min", "1se"),
+    seed = 1
+){
+  screen_method <- match.arg(screen_method)
+  lambda_choice <- match.arg(lambda_choice)
+  
+  set.seed(seed)
+  
+  dat0 <- df %>%
+    select(all_of(c(outcome_col, covars, metab_cols_all))) %>%
+    mutate(across(all_of(metab_cols_all), numify))
+  
+  dat0[[outcome_col]] <- numify(dat0[[outcome_col]])
+  dat0 <- dat0 %>% filter(!is.na(.data[[outcome_col]]))
+  
+  n <- nrow(dat0)
+  if (n < K * 2) stop("Too few samples for chosen K.")
+  
+  make_folds <- function(n, K) sample(rep(1:K, length.out = n))
+  
+  perf_m1 <- list()
+  perf_m2 <- list()
+  
+  for (r in seq_len(R)){
+    fold_id <- make_folds(n, K)
+    
+    for (k in seq_len(K)){
+      idx_te <- which(fold_id == k)
+      idx_tr <- setdiff(seq_len(n), idx_te)
+      
+      tr0 <- dat0[idx_tr, , drop = FALSE]
+      te0 <- dat0[idx_te, , drop = FALSE]
+      
+      ## -----------------------------------------
+      ## same TRAIN-only screening for both methods
+      ## -----------------------------------------
+      mets_sel <- screen_mets_train(
+        tr_df = tr0,
+        outcome_col = outcome_col,
+        covars = covars,
+        metab_cols = metab_cols_all,
+        method = screen_method,
+        p_thresh = p_thresh,
+        topk = topk,
+        min_n = 25
+      )
+      
+      if (length(mets_sel) == 0) next
+      
+      ytr <- numify(tr0[[outcome_col]])
+      yte <- numify(te0[[outcome_col]])
+      
+      ## =========================================
+      ## Method 1: metabolite-only index + covars
+      ## =========================================
+      pp_met <- prep_x_train_test(tr0, te0, mets_sel)
+      Xtr_met <- pp_met$Xtr
+      Xte_met <- pp_met$Xte
+      
+      cvfit_m1 <- cv.glmnet(
+        x = Xtr_met,
+        y = ytr,
+        family = "gaussian",
+        alpha = alpha,
+        standardize = FALSE
+      )
+      lam1 <- if (lambda_choice == "1se") cvfit_m1$lambda.1se else cvfit_m1$lambda.min
+      
+      b1 <- as.matrix(coef(cvfit_m1, s = lam1))
+      beta_mets <- as.numeric(b1[mets_sel, 1])
+      names(beta_mets) <- mets_sel
+      
+      if (all(beta_mets == 0)) {
+        w1 <- rep(0, length(beta_mets))
+        names(w1) <- names(beta_mets)
+      } else {
+        w1 <- beta_mets / sum(abs(beta_mets))
+      }
+      
+      idx_tr_score <- as.numeric(Xtr_met %*% w1)
+      idx_te_score <- as.numeric(Xte_met %*% w1)
+      
+      mu_i <- mean(idx_tr_score, na.rm = TRUE)
+      sd_i <- sd(idx_tr_score, na.rm = TRUE)
+      if (is.na(sd_i) || sd_i == 0) sd_i <- 1
+      
+      tr_eval <- tr0
+      te_eval <- te0
+      tr_eval$index_z <- (idx_tr_score - mu_i) / sd_i
+      te_eval$index_z <- (idx_te_score - mu_i) / sd_i
+      
+      covars_use <- covars
+      for (cv in covars_use){
+        if (is.character(tr_eval[[cv]]) || is.factor(tr_eval[[cv]])){
+          tr_eval[[cv]] <- factor(tr_eval[[cv]])
+          te_eval[[cv]] <- factor(te_eval[[cv]], levels = levels(tr_eval[[cv]]))
+          if (nlevels(tr_eval[[cv]]) < 2){
+            covars_use <- setdiff(covars_use, cv)
+          }
+        }
+      }
+      
+      fml1 <- reformulate(c("index_z", covars_use), response = outcome_col)
+      fit1 <- lm(fml1, data = tr_eval)
+      pred1 <- predict(fit1, newdata = te_eval)
+      
+      rmse1 <- sqrt(mean((yte - pred1)^2, na.rm = TRUE))
+      mae1  <- mean(abs(yte - pred1), na.rm = TRUE)
+      r21   <- 1 - sum((yte - pred1)^2, na.rm = TRUE) /
+        sum((yte - mean(yte, na.rm = TRUE))^2, na.rm = TRUE)
+      
+      perf_m1[[length(perf_m1) + 1]] <- data.frame(
+        rep = r,
+        fold = k,
+        method = "Method1_index_plus_covars",
+        n_selected = length(mets_sel),
+        rmse = rmse1,
+        mae = mae1,
+        r2 = r21
+      )
+      
+      ## =========================================
+      ## Method 2: covars + metabolites jointly in glmnet
+      ## =========================================
+      pp_cov <- prep_covars_train_test(tr0, te0, covars)
+      Xtr_cov <- pp_cov$Xtr
+      Xte_cov <- pp_cov$Xte
+      
+      Xtr_joint <- cbind(Xtr_met, Xtr_cov)
+      Xte_joint <- cbind(Xte_met, Xte_cov)
+      
+      cvfit_m2 <- cv.glmnet(
+        x = Xtr_joint,
+        y = ytr,
+        family = "gaussian",
+        alpha = alpha,
+        standardize = FALSE
+      )
+      lam2 <- if (lambda_choice == "1se") cvfit_m2$lambda.1se else cvfit_m2$lambda.min
+      
+      pred2 <- as.numeric(
+        predict(cvfit_m2, newx = Xte_joint, s = lam2)
+      )
+      
+      rmse2 <- sqrt(mean((yte - pred2)^2, na.rm = TRUE))
+      mae2  <- mean(abs(yte - pred2), na.rm = TRUE)
+      r22   <- 1 - sum((yte - pred2)^2, na.rm = TRUE) /
+        sum((yte - mean(yte, na.rm = TRUE))^2, na.rm = TRUE)
+      
+      perf_m2[[length(perf_m2) + 1]] <- data.frame(
+        rep = r,
+        fold = k,
+        method = "Method2_joint_glmnet",
+        n_selected = length(mets_sel),
+        rmse = rmse2,
+        mae = mae2,
+        r2 = r22
+      )
+    }
+  }
+  
+  perf_m1_df <- bind_rows(perf_m1)
+  perf_m2_df <- bind_rows(perf_m2)
+  perf_all   <- bind_rows(perf_m1_df, perf_m2_df)
+  
+  summary_tab <- bind_rows(
+    summarize_perf(perf_m1_df, "Method1_index_plus_covars"),
+    summarize_perf(perf_m2_df, "Method2_joint_glmnet")
+  )
+  
+  # decide winner
+  winner_r2   <- summary_tab$method[which.max(summary_tab$median_R2)]
+  winner_rmse <- summary_tab$method[which.min(summary_tab$median_RMSE)]
+  winner_mae  <- summary_tab$method[which.min(summary_tab$median_MAE)]
+  
+  cat("\n================ MODEL COMPARISON ================\n")
+  print(summary_tab, row.names = FALSE)
+  cat("--------------------------------------------------\n")
+  cat("Higher median R2 winner   :", winner_r2, "\n")
+  cat("Lower median RMSE winner  :", winner_rmse, "\n")
+  cat("Lower median MAE winner   :", winner_mae, "\n")
+  
+  if (winner_r2 == winner_rmse && winner_rmse == winner_mae) {
+    cat("Overall better model      :", winner_r2, "\n")
+  } else {
+    cat("Overall better model      : mixed results across metrics\n")
+  }
+  cat("==================================================\n\n")
+  
+  list(
+    perf_all = perf_all,
+    perf_method1 = perf_m1_df,
+    perf_method2 = perf_m2_df,
+    summary = summary_tab
+  )
+}
+
+
+cmp_res <- compare_two_methods_nested_cv(
+  df = adult_df,
+  outcome_col = pdff_outcome_col,
+  covars = adult_covars,          # c("Age","Sex","BodyFatPercent")
+  metab_cols_all = metab_cols_all,
+  alpha = ENET_ALPHA,             # 0.2
+  K = 5,
+  R = 30,                         # 10 is also fine at first; use 30 for the formal run
+  screen_method = "topk",
+  topk = 10,
+  lambda_choice = "min",
+  seed = 1
+)
+
+cmp_res$summary
+head(cmp_res$perf_all)
+
+# get tables
+cmp_res$summary %>%
+  mutate(across(where(is.numeric), ~ round(., 3)))
+
+# save
+write.csv(cmp_res$summary,
+          "Compare_Method1_vs_Method2_nestedCV.csv",
+          row.names = FALSE)
+
+write.csv(cmp_res$perf_all,
+          "Compare_Method1_vs_Method2_nestedCV_allfolds.csv",
+          row.names = FALSE)
+
+
+## Make figures for comparing Method 1 and 2
+
+# arrange data
+library(dplyr)
+library(ggplot2)
+
+plot_df <- cmp_res$perf_all %>%
+  dplyr::select(method, r2, rmse, mae) %>%
+  mutate(
+    method = factor(
+      method,
+      levels = c("Method1_index_plus_covars", "Method2_joint_glmnet"),
+      labels = c("Metabolite index + covariates", "Joint glmnet model")
+    )
+  )
+
+# Unify theme
+BASE_SIZE <- 15
+
+theme_pub <- function(base_size = BASE_SIZE){
+  theme_classic(base_size = base_size) +
+    theme(
+      axis.title = element_text(size = base_size),
+      axis.text  = element_text(size = base_size),
+      plot.title = element_text(size = base_size, face = "bold", hjust = 0.5),
+      legend.title = element_blank(),
+      legend.text  = element_text(size = base_size - 1),
+      strip.text   = element_text(size = base_size, face = "bold")
+    )
+}
+
+# Plot 3 figures
+# R2
+p_r2 <- ggplot(plot_df, aes(x = method, y = r2, fill = method)) +
+  geom_boxplot(width = 0.65, outlier.shape = 16, outlier.size = 1.8, alpha = 0.85) +
+  labs(
+    x = NULL,
+    y = expression(R^2),
+    title = expression("Comparison of predictive performance ("*R^2*")")
+  ) +
+  theme_pub(BASE_SIZE) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 50, hjust = 1)
+  )
+p_r2
+
+# RMSE
+p_rmse <- ggplot(plot_df, aes(x = method, y = rmse, fill = method)) +
+  geom_boxplot(width = 0.65, outlier.shape = 16, outlier.size = 1.8, alpha = 0.85) +
+  labs(
+    x = NULL,
+    y = "RMSE",
+    title = "Comparison of predictive performance (RMSE)"
+  ) +
+  theme_pub(BASE_SIZE) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 50, hjust = 1)
+  )
+p_rmse
+
+#MAE
+p_mae <- ggplot(plot_df, aes(x = method, y = mae, fill = method)) +
+  geom_boxplot(width = 0.65, outlier.shape = 16, outlier.size = 1.8, alpha = 0.85) +
+  labs(
+    x = NULL,
+    y = "MAE",
+    title = "Comparison of predictive performance (MAE)"
+  ) +
+  theme_pub(BASE_SIZE) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 50, hjust = 1)
+  )
+p_mae
+
+# TIFF
+ggsave(
+  filename = file.path(out_dir, "Supplementary_Figure_R2_boxplot.tiff"),
+  p_r2, width = 5.2, height = 4.8, dpi = 600, compression = "lzw"
+)
+
+ggsave(
+  filename = file.path(out_dir, "Supplementary_Figure_RMSE_boxplot.tiff"),
+  p_rmse, width = 5.2, height = 4.8, dpi = 600, compression = "lzw"
+)
+
+ggsave(
+  filename = file.path(out_dir, "Supplementary_Figure_MAE_boxplot.tiff"),
+  p_mae, width = 5.2, height = 4.8, dpi = 600, compression = "lzw"
+)
+
+
+# SVG (vector)
+ggsave(
+  filename = file.path(out_dir, "Supplementary_Figure_R2_boxplot.svg"),
+  p_r2, width = 5.2, height = 4.8, dpi = 600, device = "svg"
+)
+
+ggsave(
+  filename = file.path(out_dir, "Supplementary_Figure_RMSE_boxplot.svg"),
+  p_rmse, width = 5.2, height = 4.8, dpi = 600, device = "svg"
+)
+
+ggsave(
+  filename = file.path(out_dir, "Supplementary_Figure_MAE_boxplot.svg"),
+  p_mae, width = 5.2, height = 4.8, dpi = 600, device = "svg"
+)
+
+
+
+
+
+
+
+####################################################################################################################
+
+##### Correlation analysis between PET-CT defined oxidative metabolism and Palmitoleic acid, or	Hexanoyl-L-carnitine
+library(ggplot2)
+out_dir  <- "C:/BaiduSyncdisk/R analysis/MetabolomicsKM/Data from Dennis/train80_cor"
+
+# oxidative metabolism and Palmitoleic acid
+# Data
+df <- data.frame(
+  BAT = c(
+    0.018,0.004,0.01,0.006,0.017,0.018,0.018,
+    0.012,0,0.004,
+    0.009,0.018,0.029,0.068,0.029,0.018,0.053,0.036,
+    0.018,0.04,0.0182,
+    0.0131
+  ),
+  Palmitoleic = c(
+    6.822015,14.29685,24.77452,17.5706,17.16976,21.53348,8.032977,
+    7.464602,2.193842,2.966649,
+    5.730165,3.93009,8.460744,6.319527,5.927053,7.012074,11.61749,3.402694,
+    11.71041,1.632679,3.363297,
+    2.038129
+  )
+)
+
+# Spearman correlation
+cor_test <- cor.test(df$BAT, df$Palmitoleic, method = "spearman")
+
+r_val <- round(cor_test$estimate, 2)
+p_val <- signif(cor_test$p.value, 2)
+
+label_txt <- paste0("Spearman r = ", r_val, "\nP = ", p_val)
+
+# Plot
+p <- ggplot(df, aes(x = BAT, y = Palmitoleic)) +
+  geom_point(size = 3, color = "black") +
+  
+  geom_smooth(method = "lm", se = TRUE,
+              color = "#2C7BB6", fill = "#A6CEE3", alpha = 0.4) +
+  
+  annotate("text", x = Inf, y = Inf,
+           label = label_txt,
+           hjust = 1.1, vjust = 1.5, size = 5) +
+  
+  labs(
+    x = "BAT oxidative metabolism",
+    y = "Palmitoleic acid"
+  ) +
+  
+  theme_classic(base_size = 14)
+
+print(p)
+
+# Save file
+# Save TIFF
+ggsave(
+  filename = file.path(out_dir, "BAT_Palm.tiff"),
+  plot = p,
+  device = "tiff",
+  width = 5,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+
+# Save SVG
+ggsave(
+  filename = file.path(out_dir, "BAT_Palm.svg"),
+  plot = p,
+  device = "svg",
+  width = 5,
+  height = 5,
+  units = "in"
+)
+
+
+
+# oxidative metabolism and Hexanoyl-L-carnitine
+library(ggplot2)
+
+# Data
+df <- data.frame(
+  BAT = c(
+    0.018,0.004,0.01,0.006,0.017,0.018,0.018,
+    0.012,0,0.004,
+    0.009,0.018,0.029,0.068,0.029,0.018,0.053,0.036,
+    0.018,0.04,0.0182,
+    0.0131
+  ),
+  HexCarn = c(
+    3.888796,2.899022,13.52379,3.340328,7.406734,4.102946,5.894311,
+    1.656839,3.49113,2.08093,
+    2.065282,4.72185,3.278758,3.710985,1.941374,3.478449,3.951321,4.329401,
+    2.224886,1.236086,2.094517,
+    1.877958
+  )
+)
+
+# Spearman correlation
+cor_test <- cor.test(df$BAT, df$HexCarn, method = "spearman", exact = FALSE)
+
+r_val <- round(cor_test$estimate, 2)
+p_val <- signif(cor_test$p.value, 2)
+
+label_txt <- paste0("Spearman r = ", r_val, "\nP = ", p_val)
+
+# Plot
+p <- ggplot(df, aes(x = BAT, y = HexCarn)) +
+  geom_point(size = 3, color = "black") +
+  
+  geom_smooth(method = "lm", se = TRUE,
+              color = "#2C7BB6", fill = "#A6CEE3", alpha = 0.4) +
+  
+  annotate("text", x = Inf, y = Inf,
+           label = label_txt,
+           hjust = 1.1, vjust = 1.5, size = 5) +
+  
+  labs(
+    x = "BAT oxidative metabolism",
+    y = "Hexanoyl-L-carnitine"
+  ) +
+  
+  theme_classic(base_size = 14)
+
+print(p)
+
+# Save file
+# Save TIFF
+ggsave(
+  filename = file.path(out_dir, "BAT_HexCarn.tiff"),
+  plot = p,
+  device = "tiff",
+  width = 5,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+
+# Save SVG
+ggsave(
+  filename = file.path(out_dir, "BAT_HexCarn.svg"),
+  plot = p,
+  device = "svg",
+  width = 5,
+  height = 5,
+  units = "in"
+)
+
+
+
+# oxidative metabolism and Z-score of Palmitoleic acid
+library(ggplot2)
+
+# Data
+df <- data.frame(
+  BAT = c(
+    0.018,0.004,0.01,0.006,0.017,0.018,0.018,
+    0.012,0,0.004,
+    0.009,0.018,0.029,0.068,0.029,0.018,0.053,0.036,
+    0.018,0.04,0.0182,
+    0.0131
+  ),
+  Palmitoleic = c(
+    -0.30445269,0.836387644,2.435533116,1.336040953,1.274863089,1.940872143,-0.119630645,
+    -0.206378396,-1.010823658,-0.892874647,
+    -0.471095368,-0.745830283,-0.05434307,-0.381144494,-0.441045504,-0.275445097,0.427452603,-0.826323649,
+    0.441634439,-1.096470683,-0.832336583,
+    -1.034589222
+  )
+)
+
+# Spearman correlation
+cor_test <- cor.test(df$BAT, df$Palmitoleic, method = "pearson",
+                     exact = FALSE)
+
+r_val <- round(cor_test$estimate, 2)
+p_val <- signif(cor_test$p.value, 2)
+
+label_txt <- paste0("Spearman r = ", r_val, "\nP = ", p_val)
+
+# Plot
+p <- ggplot(df, aes(x = BAT, y = Palmitoleic)) +
+  geom_point(size = 3, color = "black") +
+  
+  geom_smooth(method = "lm", se = TRUE,
+              color = "#2C7BB6", fill = "#A6CEE3", alpha = 0.4) +
+  
+  annotate("text", x = Inf, y = Inf,
+           label = label_txt,
+           hjust = 1.1, vjust = 1.5, size = 5) +
+  
+  labs(
+    x = "BAT oxidative metabolism",
+    y = "Zscore of Palmitoleic acid"
+  ) +
+  
+  theme_classic(base_size = 14)
+
+print(p)
+
+# Save file
+# Save TIFF
+ggsave(
+  filename = file.path(out_dir, "BAT_ZscorePalmitoleic.tiff"),
+  plot = p,
+  device = "tiff",
+  width = 5,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+
+# Save SVG
+ggsave(
+  filename = file.path(out_dir, "BBAT_ZscorePalmitoleic.svg"),
+  plot = p,
+  device = "svg",
+  width = 5,
+  height = 5,
+  units = "in"
+)
+
+
+
+
+# oxidative metabolism and Z-score of HexCarn
+library(ggplot2)
+
+# Data
+df <- data.frame(
+  BAT = c(
+    0.018,0.004,0.01,0.006,0.017,0.018,0.018,
+    0.012,0,0.004,
+    0.009,0.018,0.029,0.068,0.029,0.018,0.053,0.036,
+    0.018,0.04,0.0182,
+    0.0131
+  ),
+  HexCarn = c(
+    0.040876093,-0.336624497,3.715670462,-0.168310038,1.382620442,0.122553073,0.805781108,
+    -0.810394081,-0.110794036,-0.648645436,
+    -0.654613596,0.35860355,-0.191792885,-0.026941164,-0.701872206,-0.115630579,0.064723177,0.20892319,
+    -0.593740504,-0.97086961,-0.643463344,
+    -0.726059119
+  )
+)
+
+# Spearman correlation
+cor_test <- cor.test(df$BAT, df$HexCarn, method = "pearson",
+                     exact = FALSE)
+
+r_val <- round(cor_test$estimate, 2)
+p_val <- signif(cor_test$p.value, 2)
+
+label_txt <- paste0("Spearman r = ", r_val, "\nP = ", p_val)
+
+# Plot
+p <- ggplot(df, aes(x = BAT, y = HexCarn)) +
+  geom_point(size = 3, color = "black") +
+  
+  geom_smooth(method = "lm", se = TRUE,
+              color = "#2C7BB6", fill = "#A6CEE3", alpha = 0.4) +
+  
+  annotate("text", x = Inf, y = Inf,
+           label = label_txt,
+           hjust = 1.1, vjust = 1.5, size = 5) +
+  
+  labs(
+    x = "BAT oxidative metabolism",
+    y = "Zscore of Hexanoyl-L-carnitine"
+  ) +
+  
+  theme_classic(base_size = 14)
+
+print(p)
+
+# Save file
+# Save TIFF
+ggsave(
+  filename = file.path(out_dir, "BAT_ZscoreHexCarn.tiff"),
+  plot = p,
+  device = "tiff",
+  width = 5,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+
+# Save SVG
+ggsave(
+  filename = file.path(out_dir, "BBAT_ZscoreHexCarn.svg"),
+  plot = p,
+  device = "svg",
+  width = 5,
+  height = 5,
+  units = "in"
+)
+
+
+
+
+# correlation of Zscore of both oxidative metabolism and Palmitoleic acid
+
+library(ggplot2)
+
+# Data
+df <- data.frame(
+  BAT = c(
+    -0.166721559,-1.018300998,-0.653338382,-0.896646793,-0.227548662,-0.166721559,-0.166721559,
+    -0.531684176,-1.26160941,-1.018300998,
+    -0.714165484,-0.166721559,0.502376572,2.874633581,0.502376572,-0.166721559,1.962227039,0.928166292,
+    -0.166721559,1.171474703,-0.154556139,
+    -0.464774363
+  ),
+  Palm = c(
+    -0.30445269,0.836387644,2.435533116,1.336040953,1.274863089,1.940872143,-0.119630645,
+    -0.206378396,-1.010823658,-0.892874647,
+    -0.471095368,-0.745830283,-0.05434307,-0.381144494,-0.441045504,-0.275445097,0.427452603,-0.826323649,
+    0.441634439,-1.096470683,-0.832336583,
+    -1.034589222
+  )
+)
+
+# Spearman correlation
+cor_test <- cor.test(df$BAT, df$Palm, method = "pearson", exact = FALSE)
+
+r_val <- round(cor_test$estimate, 2)
+p_val <- signif(cor_test$p.value, 2)
+
+label_txt <- paste0("Spearman r = ", r_val, "\nP = ", p_val)
+
+# Plot
+p <- ggplot(df, aes(x = BAT, y = Palm)) +
+  geom_point(size = 3, color = "black") +
+  
+  geom_smooth(method = "lm", se = TRUE,
+              color = "#2C7BB6", fill = "#A6CEE3", alpha = 0.4) +
+  
+  annotate("text", x = Inf, y = Inf,
+           label = label_txt,
+           hjust = 1.1, vjust = 1.5, size = 5) +
+  
+  labs(
+    x = "BAT activity (Z-score)",
+    y = "Palmitoleic acid (Z-score)"
+  ) +
+  
+  theme_classic(base_size = 14)
+
+print(p)
+
+## Save figures
+out_dir  <- "C:/BaiduSyncdisk/R analysis/MetabolomicsKM/Data from Dennis/train80_cor"
+
+if(!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# Save TIFF
+ggsave(
+  filename = file.path(out_dir, "ZscoreBAT_ZscorePalmitoleic.tiff"),
+  plot = p,
+  device = "tiff",
+  width = 5,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+
+# Save SVG
+ggsave(
+  filename = file.path(out_dir, "ZscoreBAT_ZscorePalmitoleic.svg"),
+  plot = p,
+  device = "svg",
+  width = 5,
+  height = 5,
+  units = "in"
+)
+
+
+
+
+
+
+# correlation of Zscore of both oxidative metabolism and HexCarn
+library(ggplot2)
+
+# Data
+df <- data.frame(
+  BAT = c(
+    -0.166721559,-1.018300998,-0.653338382,-0.896646793,-0.227548662,-0.166721559,-0.166721559,
+    -0.531684176,-1.26160941,-1.018300998,
+    -0.714165484,-0.166721559,0.502376572,2.874633581,0.502376572,-0.166721559,1.962227039,0.928166292,
+    -0.166721559,1.171474703,-0.154556139,
+    -0.464774363
+  ),
+  HexCarn = c(
+    0.040876093,-0.336624497,3.715670462,-0.168310038,1.382620442,0.122553073,0.805781108,
+    -0.810394081,-0.110794036,-0.648645436,
+    -0.654613596,0.35860355,-0.191792885,-0.026941164,-0.701872206,-0.115630579,0.064723177,0.20892319,
+    -0.593740504,-0.97086961,-0.643463344,
+    -0.726059119
+  )
+)
+
+# Spearman correlation
+cor_test <- cor.test(df$BAT, df$HexCarn, method = "pearson", exact = FALSE)
+
+r_val <- round(cor_test$estimate, 2)
+p_val <- signif(cor_test$p.value, 2)
+
+label_txt <- paste0("Spearman r = ", r_val, "\nP = ", p_val)
+
+# Plot
+p <- ggplot(df, aes(x = BAT, y = HexCarn)) +
+  geom_point(size = 3, color = "black") +
+  
+  geom_smooth(method = "lm", se = TRUE,
+              color = "#2C7BB6", fill = "#A6CEE3", alpha = 0.4) +
+  
+  annotate("text", x = Inf, y = Inf,
+           label = label_txt,
+           hjust = 1.1, vjust = 1.5, size = 5) +
+  
+  labs(
+    x = "BAT activity (Z-score)",
+    y = "Hexanoyl-L-carnitine (Z-score)"
+  ) +
+  
+  theme_classic(base_size = 14)
+
+print(p)
+
+# TIFF
+ggsave(
+  filename = file.path(out_dir, "ZscoreBAT_ZscoreHexCarn.tiff"),
+  plot = p,
+  device = "tiff",
+  width = 5,
+  height = 5,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+
+# SVG
+ggsave(
+  filename = file.path(out_dir, "ZscoreBAT_ZscoreHexCarn.svg"),
+  plot = p,
+  device = "svg",
+  width = 5,
+  height = 5,
+  units = "in"
+)
+
+
+
+
+# correlation of ΔDelta of both oxidative metabolism and Palmitoleic acid
+library(ggplot2)
+
+# Data
+df <- data.frame(
+  BAT = c(0,0.025,0.058,0.023,0.001,0.035,0.018,
+          0.006,0.04,0.0142,
+          0.0041),
+  
+  Palm = c(-2.891925,-5.836106,-18.454993,-11.643547,-10.157686,
+           -9.91599,-4.630283,
+           4.245808,-0.561163,0.396648,
+           -3.692036),
+  
+  Hex = c(0.833054,0.379736,-9.812805,-1.398954,-3.928285,
+          -0.151625,-1.56491,
+          0.568047,-2.255044,0.013587,
+          -0.187324)
+)
+
+# =========================
+# 1) Palmitoleic
+# =========================
+cor_palm <- cor.test(df$BAT, df$Palm, method = "pearson", exact = FALSE)
+
+lab_palm <- paste0(
+  "Spearman r = ", round(cor_palm$estimate, 2),
+  "\nP = ", signif(cor_palm$p.value, 2)
+)
+
+p1 <- ggplot(df, aes(BAT, Palm)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = TRUE,
+              color = "#2C7BB6", fill = "#A6CEE3", alpha = 0.4) +
+  annotate("text", x = Inf, y = Inf, label = lab_palm,
+           hjust = 1.1, vjust = 1.5, size = 5) +
+  labs(x = "ΔBAT oxidative metabolism",
+       y = "ΔPalmitoleic acid") +
+  theme_classic(base_size = 14)
+
+# =========================
+# 2) Hexanoyl-carnitine
+# =========================
+cor_hex <- cor.test(df$BAT, df$Hex, method = "pearson", exact = FALSE)
+
+lab_hex <- paste0(
+  "Spearman r = ", round(cor_hex$estimate, 2),
+  "\nP = ", signif(cor_hex$p.value, 2)
+)
+
+p2 <- ggplot(df, aes(BAT, Hex)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = TRUE,
+              color = "#2C7BB6", fill = "#A6CEE3", alpha = 0.4) +
+  annotate("text", x = Inf, y = Inf, label = lab_hex,
+           hjust = 1.1, vjust = 1.5, size = 5) +
+  labs(x = "ΔBAT oxidative metabolism",
+       y = "ΔHexanoyl-L-carnitine") +
+  theme_classic(base_size = 14)
+
+print(p1)
+print(p2)
+
+# Palmitoleic
+ggsave(file.path(out_dir, "DeltaBAT_DeltaPalm.tiff"), p1,
+       device = "tiff", width = 5, height = 5, units = "in",
+       dpi = 300, compression = "lzw")
+
+ggsave(file.path(out_dir, "DeltaBAT_DeltaPalm.svg"), p1,
+       device = "svg", width = 5, height = 5, units = "in")
+
+# Hexanoyl-carnitine
+ggsave(file.path(out_dir, "DeltaBAT_DeltaHexCarn.tiff"), p2,
+       device = "tiff", width = 5, height = 5, units = "in",
+       dpi = 300, compression = "lzw")
+
+ggsave(file.path(out_dir, "DeltaBAT_DeltaHexCarn.svg"), p2,
+       device = "svg", width = 5, height = 5, units = "in")
+
+
+
+
+
+
+
+
+# correlation of oxidative metabolism and Index
+library(ggplot2)
+# Data
+df <- data.frame(
+  BAT = c(
+    0.018,0.004,0.01,0.006,0.017,0.018,0.018,
+    0.012,0,0.004,
+    0.009,0.018,0.029,0.068,0.029,0.018,0.053,0.036,
+    0.018,0.04,0.0182,
+    0.0131
+  ),
+  Index = c(
+    0.126953696,-0.233459403,-3.093523712,-0.562804544,-1.330250369,-1.006256141,-0.356030996,
+    0.516842458,0.548208432,0.767340833,
+    0.565423737,0.178151293,0.124992275,0.199083982,0.575110429,0.193300435,-0.241009678,0.294206774,
+    0.090548282,1.031911731,0.735255738,
+    0.876004749
+  )
+)
+
+# Spearman correlation
+cor_test <- cor.test(df$BAT, df$Index, method = "pearson", exact = FALSE)
+
+r_val <- round(cor_test$estimate, 2)
+p_val <- signif(cor_test$p.value, 2)
+
+label_txt <- paste0("Spearman r = ", r_val, "\nP = ", p_val)
+
+# Plot
+p <- ggplot(df, aes(x = BAT, y = Index)) +
+  geom_point(size = 3, color = "black") +
+  
+  geom_smooth(method = "lm", se = TRUE,
+              color = "#2C7BB6", fill = "#A6CEE3", alpha = 0.4) +
+  
+  annotate("text", x = Inf, y = Inf,
+           label = label_txt,
+           hjust = 1.1, vjust = 1.5, size = 5) +
+  
+  labs(
+    x = "BAT oxidative metabolism",
+    y = "BAT metabolite index (1se)"
+  ) +
+  
+  theme_classic(base_size = 14)
+
+print(p)
+
+
+
+
+
+
+# correlation of zscore of oxidative metabolism and Index
+library(ggplot2)
+
+# Data
+df <- data.frame(
+  BAT = c(
+    -0.166721559,-1.018300998,-0.653338382,-0.896646793,-0.227548662,-0.166721559,-0.166721559,
+    -0.531684176,-1.26160941,-1.018300998,
+    -0.714165484,-0.166721559,0.502376572,2.874633581,0.502376572,-0.166721559,1.962227039,0.928166292,
+    -0.166721559,1.171474703,-0.154556139,
+    -0.464774363
+  ),
+  Index = c(
+    0.126953696,-0.233459403,-3.093523712,-0.562804544,-1.330250369,-1.006256141,-0.356030996,
+    0.516842458,0.548208432,0.767340833,
+    0.565423737,0.178151293,0.124992275,0.199083982,0.575110429,0.193300435,-0.241009678,0.294206774,
+    0.090548282,1.031911731,0.735255738,
+    0.876004749
+  )
+)
+
+# Pearson correlation
+cor_test <- cor.test(df$BAT, df$Index, method = "pearson")
+
+r_val <- round(cor_test$estimate, 2)
+p_val <- signif(cor_test$p.value, 2)
+
+label_txt <- paste0("Pearson r = ", r_val, "\nP = ", p_val)
+
+# Plot
+p <- ggplot(df, aes(x = BAT, y = Index)) +
+  geom_point(size = 3, color = "black") +
+  
+  geom_smooth(method = "lm", se = TRUE,
+              color = "#2C7BB6", fill = "#A6CEE3", alpha = 0.4) +
+  
+  annotate("text", x = Inf, y = Inf,
+           label = label_txt,
+           hjust = 1.1, vjust = 1.5, size = 5) +
+  
+  labs(
+    x = "BAT activity (Z-score)",
+    y = "BAT metabolite index (1se)"
+  ) +
+  
+  theme_classic(base_size = 14)
+
+print(p)
+
+
+
+
+## Following figure are in the paper
+# correlation of ΔDelta of both oxidative metabolism and Zscore of both Palmitoleic acid and Hex
+library(ggplot2)
+
+# Data
+df <- data.frame(
+  BAT = c(0,0.025,0.058,0.023,0.001,0.035,0.018,
+          0.006,0.04,0.0142,
+          0.0041),
+  
+  Palm = c(-0.441377593,-0.890730714,-2.81667761,-1.777086457,
+           -1.550308186,-1.51341954,-0.706693005,
+           0.648012835,-0.085647026,0.060538064,
+           -0.563493854),
+  
+  Hex = c(0.317727458,0.144831612,-3.742611626,-0.533562167,
+          -1.498251021,-0.057829896,-0.596857918,
+          0.216653577,-0.860075574,0.005182093,
+          -0.071445522)
+)
+
+# =========================
+# Palmitoleic
+# =========================
+cor_palm <- cor.test(df$BAT, df$Palm, method = "pearson", exact = FALSE)
+
+lab_palm <- paste0(
+  "Pearson r = ", round(cor_palm$estimate, 2),
+  "\nP = ", signif(cor_palm$p.value, 2)
+)
+
+p1 <- ggplot(df, aes(Palm, BAT)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = TRUE,
+              color = "#2C7BB6", fill = "#A6CEE3", alpha = 0.4) +
+  annotate("text", x = Inf, y = Inf, label = lab_palm,
+           hjust = 1.1, vjust = 1.5, size = 5) +
+  labs(y = "ΔBAT oxidative metabolism",
+       x = "ΔZ-score Palmitoleic acid") +
+  theme_classic(base_size = 14)
+
+# =========================
+# Hexanoyl-carnitine
+# =========================
+cor_hex <- cor.test(df$BAT, df$Hex, method = "pearson", exact = FALSE)
+
+lab_hex <- paste0(
+  "Pearson r = ", round(cor_hex$estimate, 2),
+  "\nP = ", signif(cor_hex$p.value, 2)
+)
+
+p2 <- ggplot(df, aes(Hex, BAT)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = TRUE,
+              color = "#2C7BB6", fill = "#A6CEE3", alpha = 0.4) +
+  annotate("text", x = Inf, y = Inf, label = lab_hex,
+           hjust = 1.1, vjust = 1.5, size = 5) +
+  labs(y = "ΔBAT oxidative metabolism",
+       x = "ΔZ-score Hexanoyl-L-carnitine") +
+  theme_classic(base_size = 14)
+
+print(p1)
+print(p2)
+
+# Palmitoleic
+ggsave(file.path(out_dir, "DeltaBAT_DeltaZscorePalm.tiff"), p1,
+       device = "tiff", width = 3.5, height = 3, units = "in",
+       dpi = 300, compression = "lzw")
+
+ggsave(file.path(out_dir, "DeltaBAT_DeltaZscorePalm.svg"), p1,
+       device = "svg", width = 3.5, height = 3, units = "in")
+
+# Hexanoyl-carnitine
+ggsave(file.path(out_dir, "DeltaBAT_DeltaZscoreHexCarn.tiff"), p2,
+       device = "tiff", width = 3.5, height = 3, units = "in",
+       dpi = 300, compression = "lzw")
+
+ggsave(file.path(out_dir, "DeltaBAT_DeltaZscoreHexCarn.svg"), p2,
+       device = "svg", width = 3.5, height = 3, units = "in")
+
+
+
+
+
+
+
+
+
+# correlation of ΔDelta of both oxidative metabolism and index
+library(ggplot2)
+
+# Data
+df <- data.frame(
+  BAT = c(0,0.025,0.058,0.023,0.001,0.035,0.018,
+          0.006,0.04,0.0142,
+          0.0041),
+  
+  Index = c(0.051197597,0.358451679,3.292607694,1.137914972,
+            1.523550803,0.765246463,0.65023777,
+            -0.426294176,0.483703299,-0.032085095,
+            0.310581012)
+)
+
+# Pearson correlation
+cor_test <- cor.test(df$BAT, df$Index, method = "pearson")
+
+r_val <- round(cor_test$estimate, 2)
+p_val <- signif(cor_test$p.value, 2)
+
+label_txt <- paste0("Pearson r = ", r_val, "\nP = ", p_val)
+
+# Plot
+p <- ggplot(df, aes(x = Index, y = BAT)) +
+  geom_point(size = 3, color = "black") +
+  
+  geom_smooth(method = "lm", se = TRUE,
+              color = "#2C7BB6", fill = "#A6CEE3", alpha = 0.4) +
+  
+  annotate("text", x = Inf, y = Inf,
+           label = label_txt,
+           hjust = 1.1, vjust = 1.5, size = 5) +
+  
+  labs(
+    y = "ΔBAT oxidative metabolism",
+    x = "ΔMetabolite index"
+  ) +
+  
+  theme_classic(base_size = 14)
+
+print(p)
+
+# TIFF
+ggsave(
+  filename = file.path(out_dir, "DeltaBAT_DeltaIndex_Pearson.tiff"),
+  plot = p,
+  device = "tiff",
+  width = 3.5, height = 3,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+
+# SVG
+ggsave(
+  filename = file.path(out_dir, "DeltaBAT_DeltaIndex_Pearson.svg"),
+  plot = p,
+  device = "svg",
+  width = 3.5, height = 3,
+  units = "in"
+)
+
+
+
+
+
+
+
+
+
+
+
+####### receiver operating characteristic (ROC) analysis
+# set After = 1, Before = 0
+# compute ROC and AUC
+# plot all ROC curves together
+# optionally save the figure as TIFF and SVG
+
+library(pROC)
+library(ggplot2)
+library(dplyr)
+library(readr)
+
+## =========================
+## 1) Input data
+## =========================
+df <- data.frame(
+  ColdExposure = c(
+    "Before","Before","Before","Before","Before","Before","Before",
+    "Before","Before","Before","Before",
+    
+    "After","After","After","After","After","After","After",
+    "After","After","After","After"
+  ),
+  Zscore_Palmitoleic = c(
+    -0.30445269,  0.836387644,  2.435533116,  1.336040953,  1.274863089,
+    1.940872143, -0.119630645,
+    -0.206378396, -1.010823658, -0.892874647,
+    -0.471095368,
+    -0.745830283, -0.05434307,  -0.381144494, -0.441045504, -0.275445097,
+    0.427452603, -0.826323649,
+    0.441634439, -1.096470683, -0.832336583,
+    -1.034589222
+  ),
+  Zscore_Hexanoyl = c(
+    0.040876093, -0.336624497,  3.715670462, -0.168310038,  1.382620442,
+    0.122553073,  0.805781108,
+    -0.810394081, -0.110794036, -0.648645436,
+    -0.654613596,
+    0.35860355,  -0.191792885, -0.026941164, -0.701872206, -0.115630579,
+    0.064723177,  0.20892319,
+    -0.593740504, -0.97086961,  -0.643463344,
+    -0.726059119
+  ),
+  Palmitoleic = c(
+    6.822015, 14.29685, 24.77452, 17.5706, 17.16976, 21.53348,  8.032977,
+    7.464602,  2.193842,  2.966649,
+    5.730165,
+    3.93009,   8.460744,  6.319527,  5.927053,  7.012074, 11.61749,  3.402694,
+    11.71041,   1.632679,  3.363297,
+    2.038129
+  ),
+  Hexanoyl = c(
+    3.888796,  2.899022, 13.52379,  3.340328,  7.406734,  4.102946,  5.894311,
+    1.656839,  3.49113,   2.08093,
+    2.065282,
+    4.72185,   3.278758,  3.710985,  1.941374,  3.478449,  3.951321,  4.329401,
+    2.224886,  1.236086,  2.094517,
+    1.877958
+  ),
+  Index_1se = c(
+    0.126953696, -0.233459403, -3.093523712, -0.562804544, -1.330250369,
+    -1.006256141, -0.356030996,
+    0.516842458,  0.548208432,  0.767340833,
+    0.565423737,
+    0.178151293,  0.124992275,  0.199083982,  0.575110429,  0.193300435,
+    -0.241009678,  0.294206774,
+    0.090548282,  1.031911731,  0.735255738,
+    0.876004749
+  )
+)
+
+## =========================
+## 2) Binary outcome
+## After = 1, Before = 0
+## =========================
+df$y <- ifelse(df$ColdExposure == "After", 1, 0)
+
+table(df$ColdExposure, df$y)
+
+## =========================
+## 3) ROC helper function
+## direction is set automatically
+## =========================
+get_roc <- function(marker, outcome, marker_name){
+  roc_obj <- roc(
+    response = outcome,
+    predictor = marker,
+    quiet = TRUE,
+    ci = TRUE
+  )
+  
+  auc_val <- as.numeric(auc(roc_obj))
+  ci_val  <- ci.auc(roc_obj)
+  
+  list(
+    roc = roc_obj,
+    auc = auc_val,
+    ci_low = as.numeric(ci_val[1]),
+    ci_high = as.numeric(ci_val[3]),
+    name = marker_name
+  )
+}
+
+## =========================
+## 4) Run ROC for each marker
+## =========================
+roc_list <- list(
+  get_roc(df$Zscore_Palmitoleic, df$y, "Zscore_Palmitoleic"),
+  get_roc(df$Zscore_Hexanoyl,    df$y, "Zscore_Hexanoyl-L-carnitine"),
+  get_roc(df$Palmitoleic,        df$y, "Palmitoleic acid"),
+  get_roc(df$Hexanoyl,           df$y, "Hexanoyl-L-carnitine"),
+  get_roc(df$Index_1se,          df$y, "Index_1se")
+)
+
+## =========================
+## 5) AUC summary table
+## =========================
+auc_table <- bind_rows(lapply(roc_list, function(x){
+  data.frame(
+    Marker = x$name,
+    AUC = round(x$auc, 3),
+    CI95 = paste0("(", round(x$ci_low, 3), ", ", round(x$ci_high, 3), ")")
+  )
+}))
+
+print(auc_table)
+
+## =========================
+## 6) Best cutoff / sensitivity / specificity
+## =========================
+best_cut_table <- bind_rows(lapply(roc_list, function(x){
+  best <- coords(
+    x$roc, "best",
+    ret = c("threshold", "sensitivity", "specificity"),
+    transpose = FALSE
+  )
+  data.frame(
+    Marker = x$name,
+    Threshold = best["threshold"],
+    Sensitivity = best["sensitivity"],
+    Specificity = best["specificity"]
+  )
+}))
+
+print(best_cut_table)
+
+## =========================
+## 7) Build plotting dataframe for ggplot
+## =========================
+roc_df <- bind_rows(lapply(roc_list, function(x){
+  data.frame(
+    FPR = 1 - x$roc$specificities,
+    TPR = x$roc$sensitivities,
+    Marker = paste0(
+      x$name, " (AUC=", sprintf("%.3f", x$auc), ")"
+    )
+  )
+}))
+
+## =========================
+## 8) Plot ROC curves
+## =========================
+p_roc <- ggplot(roc_df, aes(x = FPR, y = TPR, color = Marker)) +
+  geom_line(linewidth = 1.2) +
+  geom_abline(intercept = 0, slope = 1, linetype = 2, color = "grey50") +
+  coord_equal() +
+  labs(
+    x = "1 - Specificity",
+    y = "Sensitivity",
+    title = "ROC curves for discriminating Before vs After cold exposure"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 14),
+    legend.title = element_blank(),
+    legend.position = "right"
+  )
+
+print(p_roc)
+
+## =========================
+## 9) Save ROC figure
+## =========================
+out_dir  <- "C:/BaiduSyncdisk/R analysis/MetabolomicsKM/Data from Dennis/train80_cor"
+if(!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+ggsave(
+  filename = file.path(out_dir, "ROC_Before_vs_After_ColdExposure.tiff"),
+  plot = p_roc,
+  device = "tiff",
+  width = 6.5,
+  height = 5.5,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+
+ggsave(
+  filename = file.path(out_dir, "ROC_Before_vs_After_ColdExposure.svg"),
+  plot = p_roc,
+  device = "svg",
+  width = 6.5,
+  height = 5.5,
+  units = "in"
+)
+
+
+
+
+#### Only plot"Zscore_Palmitoleic", "Zscore_Hexanoyl-L-carnitine", "Index_1se"
+
+## =========================
+## 7) Keep only the specified markers
+## =========================
+markers_keep <- c(
+  "Zscore_Palmitoleic",
+  "Zscore_Hexanoyl-L-carnitine",
+  "Index_1se"
+)
+
+roc_df <- bind_rows(lapply(roc_list, function(x){
+  if(x$name %in% markers_keep){
+    data.frame(
+      FPR = 1 - x$roc$specificities,
+      TPR = x$roc$sensitivities,
+      Marker = paste0(
+        x$name, " (AUC=", sprintf("%.3f", x$auc), ")"
+      )
+    )
+  }
+}))
+
+## Remove NULL
+roc_df <- roc_df %>% filter(!is.na(FPR))
+
+## =========================
+## 8) Plot ROC curves (unified font)
+## =========================
+BASE_SIZE <- 14
+
+p_roc <- ggplot(roc_df, aes(x = FPR, y = TPR, color = Marker)) +
+  
+  geom_line(linewidth = 0.5) +
+  
+  geom_abline(
+    intercept = 0, slope = 1,
+    linetype = 2,
+    color = "grey60"
+  ) +
+  
+  coord_equal() +
+  
+  labs(
+    x = "1 - Specificity",
+    y = "Sensitivity",
+    title = "ROC curves for discriminating Before vs After cold exposure"
+  ) +
+  
+  theme_classic(base_size = BASE_SIZE) +
+  
+  theme(
+    # 🔥 all fonts unified
+    text = element_text(size = BASE_SIZE),
+    
+    plot.title = element_text(size = BASE_SIZE),
+    
+    axis.title = element_text(size = BASE_SIZE),
+    axis.text  = element_text(size = BASE_SIZE),
+    
+    legend.text = element_text(size = BASE_SIZE),
+    legend.title = element_blank(),
+    
+    legend.position = "right"
+  )
+
+print(p_roc)
+
+# save file
+out_dir  <- "C:/BaiduSyncdisk/R analysis/MetabolomicsKM/Data from Dennis/train80_cor"
+if(!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+ggsave(
+  filename = file.path(out_dir, "ROC_Before_vs_After_Cold.tiff"),
+  plot = p_roc,
+  device = "tiff",
+  width = 8,  height = 6.5,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+
+ggsave(
+  filename = file.path(out_dir, "ROC_Before_vs_After_Cold.svg"),
+  plot = p_roc,
+  device = "svg",
+  width = 8,  height = 6.5,
+  units = "in"
+)
+
+
+
+
+
+# If you want to plot the ROC for Index_1se separately
+roc_index <- roc(df$y, df$Index_1se, ci = TRUE, quiet = TRUE)
+
+plot(roc_index, col = "#2C7BB6", lwd = 3,
+     main = "ROC: Index_1se for Before vs After cold exposure")
+abline(a = 0, b = 1, lty = 2)
+
+auc(roc_index)
+ci.auc(roc_index)
+
+coords(roc_index, "best",
+       ret = c("threshold", "sensitivity", "specificity"))
+
+
+
+
+
+
+
+
